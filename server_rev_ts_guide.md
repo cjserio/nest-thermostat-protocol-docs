@@ -164,10 +164,12 @@ Either works. The key is consistency - pick one approach and stick with it.
 Include the current server time in response headers:
 
 ```
-X-nl-service-timestamp: 1706900000
+X-nl-service-timestamp: 1706900000000
 ```
 
-This is Unix timestamp in **seconds** (not milliseconds). Devices use this to detect clock skew. If the device's clock differs from the server by more than 10 minutes, it will automatically correct itself.
+This is Unix timestamp in **milliseconds** (same as `object_timestamp` fields). Devices use this to detect clock skew. If the device's clock differs from the server by more than 10 minutes, it will automatically correct itself.
+
+Note: The firmware internally converts to seconds when calling `settimeofday()`, but the header value itself must be in milliseconds.
 
 ---
 
