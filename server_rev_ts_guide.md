@@ -1,17 +1,17 @@
 # Server Developer Guide: Revision and Timestamp Handling
 
-This document explains how Nest devices use `revision` and `timestamp` fields for data synchronization, and what server implementations must do to maintain consistency.
+This document explains how to handle `revision` and `timestamp` fields when implementing a server that communicates with Nest devices.
 
 ---
 
 ## Overview
 
-Nest devices use a dual-component versioning system to synchronize state with the cloud:
+Nest devices use a versioning system to synchronize state with the cloud:
 
-- **`timestamp`**: 64-bit integer, milliseconds since Unix epoch. Primary comparison key.
-- **`revision`**: 32-bit signed integer, increments on each modification. Tiebreaker when timestamps are equal.
+- **`timestamp`**: 64-bit integer, milliseconds since Unix epoch. **This is the sole authority for sync decisions.**
+- **`revision`**: 32-bit signed integer, increments on each modification. The server must store and return this value, but it is only validated for conditional writes (when `if_object_revision` is present).
 
-**The golden rule**: Timestamp wins. Revision is only consulted when timestamps are identical.
+**The golden rule**: Timestamp alone determines which data is newer. Revision is not used for sync decisions.
 
 ---
 
@@ -51,41 +51,32 @@ Always use `object_revision` and `object_timestamp`:
 
 The device sends one of two revision fields depending on bucket type:
 
-| Field | When Used | Meaning |
+| Field | When Used | Purpose |
 |-------|-----------|---------|
-| `base_object_revision` | Normal buckets | Informational - device's current revision |
-| `if_object_revision` | Conditional buckets | **Must match** server's revision or reject the PUT |
+| `base_object_revision` | Most buckets | Informational only - no server action required |
+| `if_object_revision` | Certain buckets | **Conditional write** - must match server's revision or reject |
 
-The `if_object_revision` field implements optimistic locking. If it doesn't match your stored revision, return HTTP 409 Conflict or similar - the device will re-fetch and retry.
+When `if_object_revision` is present, the server must verify it matches the stored revision before accepting the write. If it doesn't match, return HTTP 409 Conflict. This prevents race conditions when multiple sources might modify the same bucket.
 
 ---
 
-## Conflict Resolution Rules
+## Sync Decision Rules
 
-When the server receives data from a device, or when deciding what to send to a device, apply these rules **in order**:
+When deciding whether to accept incoming data or what to send to a device, use **only the timestamp**:
 
-### Rule 1: Compare Timestamps First
+### Rule 1: Compare Timestamps
 
 ```
 if (incoming_timestamp > stored_timestamp) → accept incoming data
 if (incoming_timestamp < stored_timestamp) → reject as stale
-if (incoming_timestamp == stored_timestamp) → go to Rule 2
+if (incoming_timestamp == stored_timestamp) → already synced, no action needed
 ```
 
-### Rule 2: Compare Revisions (Tiebreaker)
-
-Only when timestamps are exactly equal:
-
-```
-if (incoming_revision > stored_revision) → accept incoming data
-if (incoming_revision <= stored_revision) → reject as stale
-```
-
-### Rule 3: Zero Timestamp Means "No Data"
+### Rule 2: Zero Timestamp Means "No Data"
 
 A timestamp of `0` is a sentinel value meaning "I have no data for this bucket."
 
-- **Device sends timestamp=0**: Device has no data. Server should push its current state.
+- **Device sends timestamp=0**: Device has no data. Server should send its current state.
 - **Server has timestamp=0**: Server has no data. Accept whatever the device sends.
 
 This occurs after device reboots or when a bucket is first created.
@@ -94,7 +85,7 @@ This occurs after device reboots or when a bucket is first created.
 
 ## Subscribe Request Handling
 
-Devices send subscribe requests with their current rev/ts for each bucket:
+Devices send subscribe requests with their current revision and timestamp for each bucket:
 
 ```json
 {
@@ -110,13 +101,12 @@ Devices send subscribe requests with their current rev/ts for each bucket:
 
 ### Server Response Logic
 
-For each requested bucket:
+For each requested bucket, compare timestamps:
 
 1. **If device timestamp is 0**: Always send your current data
 2. **If your timestamp > device timestamp**: Send your current data
-3. **If your timestamp < device timestamp**: Send nothing (or empty object) - device is ahead
-4. **If timestamps equal and your revision > device revision**: Send your current data
-5. **If timestamps equal and your revision <= device revision**: Send nothing - device is current
+3. **If your timestamp < device timestamp**: Send nothing - device has newer data
+4. **If timestamps are equal**: Send nothing - already synced
 
 For long-polling implementations: if no buckets have updates, hold the connection open until data changes or timeout.
 
@@ -136,16 +126,16 @@ When a device sends a PUT:
 
 ### Server Processing
 
-1. **Check conditional writes**: If `if_object_revision` is present, verify it matches your stored revision. If not, reject with 409.
+1. **Check for conditional write**: If `if_object_revision` is present, verify it matches your stored revision. If not, reject with 409 Conflict.
 
-2. **Apply conflict resolution**: Compare incoming rev/ts against stored values using the rules above.
+2. **Compare timestamps**: Use the sync decision rules above. Only accept if the incoming timestamp is greater than your stored timestamp (or your timestamp is 0).
 
 3. **If accepting the update**:
    - Store the new value
-   - Store the incoming revision (or increment your own - see note below)
-   - Store the incoming timestamp (or use current server time - see note below)
+   - Store the incoming revision (or increment your own)
+   - Store the incoming timestamp (or use current server time)
 
-4. **Return the new rev/ts** in the response so the device knows the write succeeded.
+4. **Return the new revision and timestamp** in the response.
 
 ### Note on Rev/Ts Authority
 
@@ -153,9 +143,9 @@ You have two options:
 
 **Option A - Trust device values**: Store exactly what the device sends. Simpler, but relies on device clocks being reasonably accurate.
 
-**Option B - Server authoritative**: Ignore device rev/ts, use server time and increment your own revision counter. More consistent, but devices auto-correct clocks if skew exceeds 10 minutes anyway.
+**Option B - Server authoritative**: Use server time and increment your own revision counter. More consistent, but devices auto-correct clocks if skew exceeds 10 minutes anyway.
 
-Either works. The key is consistency - pick one approach and stick with it.
+Either approach works. The key is consistency - pick one and stick with it.
 
 ---
 
@@ -167,71 +157,47 @@ Include the current server time in response headers:
 X-nl-service-timestamp: 1706900000000
 ```
 
-This is Unix timestamp in **milliseconds** (same as `object_timestamp` fields). Devices use this to detect clock skew. If the device's clock differs from the server by more than 10 minutes, it will automatically correct itself.
+This is Unix timestamp in **milliseconds**. Devices use this to detect and correct clock skew. The threshold for automatic correction is 10 minutes.
 
 ---
 
-## Edge Case: Server Offline Then Returns
+## Edge Cases
+
+### Server Offline Then Returns
 
 **Scenario**: Server was down, device made local changes, server comes back.
 
-**What happens**:
-1. Device sends subscribe with its current (newer) rev/ts
-2. Server compares and sees device timestamp > server timestamp
-3. Server recognizes device has newer data
-4. Device sends PUT with its changes
-5. Server accepts (device timestamp wins)
+**Resolution**: Timestamp comparison handles this automatically. The device's newer timestamp wins.
 
-**No special handling required** - the timestamp comparison naturally resolves this.
-
----
-
-## Edge Case: Device Reboots
+### Device Reboots
 
 **Scenario**: Device loses power, reboots, reconnects.
 
-**What happens**:
-1. Device initializes with revision=0, timestamp=0
-2. Device sends subscribe with rev=0, ts=0
-3. Server sees timestamp=0 (sentinel for "no data")
-4. Server pushes its current state to the device
+**What happens**: Device sends timestamp=0, indicating it has no data. Server must push its current state.
 
-**Server requirement**: Always push data when device timestamp is 0.
+**Server requirement**: Always send data when device timestamp is 0.
 
----
-
-## Edge Case: Race Between PUT and Subscribe
-
-**Scenario**: Device sends PUT, then receives subscribe response that was in-flight.
-
-**What happens**: The device handles this internally with an "embargo" system - it buffers subscribe responses while a PUT is in progress, then applies conflict resolution after the PUT completes.
-
-**Server requirement**: None. Just respond to requests normally. The device handles the race.
-
----
-
-## Edge Case: Simultaneous Modifications
+### Simultaneous Modifications
 
 **Scenario**: Device and server both modify the same bucket at nearly the same time.
 
-**Resolution**: Whichever write has the later timestamp wins. If timestamps are identical (unlikely but possible), higher revision wins. If both are identical, the receiver of the message keeps its version (effectively "last writer wins" at the network level).
+**Resolution**: Whichever write has the later timestamp wins. If timestamps happen to be identical, both sides consider themselves synced and no overwrite occurs.
 
-**Server requirement**: Ensure your clock is reasonably accurate. Consider using NTP.
+**Server requirement**: Ensure your clock is accurate. Use NTP.
 
 ---
 
-## Quick Reference: Response Codes
+## HTTP Response Codes
 
 | Situation | HTTP Status |
 |-----------|-------------|
 | Bucket updated successfully | 200 OK |
-| Conditional write revision mismatch | 409 Conflict |
+| Conditional write failed (`if_object_revision` mismatch) | 409 Conflict |
 | Bucket not found | 404 Not Found |
 | Malformed request | 400 Bad Request |
 
-On 404, devices will invalidate their local copy of that bucket.
-
-On 400, devices will retry up to 3 times before giving up.
+**Verified device behavior:**
+- **400**: Device retries up to 2 times (3 total attempts) before giving up
 
 ---
 
@@ -239,25 +205,25 @@ On 400, devices will retry up to 3 times before giving up.
 
 - [ ] Store `revision` (int32) and `timestamp` (int64) for each bucket
 - [ ] Update both atomically on every bucket write
-- [ ] Compare timestamp first, revision second
+- [ ] Use timestamp as the sole authority for sync decisions
 - [ ] Treat timestamp=0 as "no data" sentinel
-- [ ] Support `object_revision` in subscribe responses
-- [ ] Support both `base_object_revision` and `if_object_revision` in PUTs
-- [ ] Implement conditional write rejection for `if_object_revision` mismatches
+- [ ] Include `object_revision` and `object_timestamp` in subscribe responses
+- [ ] Handle both `base_object_revision` (ignore) and `if_object_revision` (validate) in PUTs
+- [ ] Return 409 Conflict when `if_object_revision` doesn't match
 - [ ] Include `X-nl-service-timestamp` header in responses
-- [ ] Return appropriate HTTP status codes (200, 400, 404, 409)
+- [ ] Return appropriate HTTP status codes
 
 ---
 
 ## Summary
 
-| Principle | Rule |
-|-----------|------|
-| Primary comparison | Larger timestamp wins |
-| Tiebreaker | Larger revision wins (when timestamps equal) |
-| Equal rev and ts | Receiver keeps its data |
-| Zero timestamp | Means "no data", always yields |
-| Conditional writes | `if_object_revision` must match or reject |
-| Clock sync | Send `X-nl-service-timestamp` header |
+| Principle | Server Action |
+|-----------|---------------|
+| Sync decisions | Compare timestamps only |
+| Equal timestamps | No action needed - already synced |
+| Timestamp = 0 | Sender has no data, receiver should provide theirs |
+| `if_object_revision` present | Validate against stored revision, reject with 409 if mismatch |
+| `base_object_revision` present | Informational only, no validation needed |
+| Clock sync | Send `X-nl-service-timestamp` header in responses |
 
-Follow these rules and your server will maintain consistency with Nest devices through any combination of reboots, network outages, and concurrent modifications.
+Follow these rules and your server will maintain consistency with Nest devices through reboots, network outages, and concurrent modifications.
