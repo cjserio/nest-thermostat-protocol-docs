@@ -169,8 +169,6 @@ X-nl-service-timestamp: 1706900000000
 
 This is Unix timestamp in **milliseconds** (same as `object_timestamp` fields). Devices use this to detect clock skew. If the device's clock differs from the server by more than 10 minutes, it will automatically correct itself.
 
-Note: The firmware internally converts to seconds when calling `settimeofday()`, but the header value itself must be in milliseconds.
-
 ---
 
 ## Edge Case: Server Offline Then Returns
