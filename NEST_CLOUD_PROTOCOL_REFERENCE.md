@@ -2,7 +2,7 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 1.3
+**Revision**: 1.4
 **Last updated**: 2026-02-06
 
 ---
@@ -1154,8 +1154,8 @@ To display a dialog, push a `dialog_id` value. To dismiss the dialog, clear or e
 | 200 | Success | Process response |
 | 400 | Malformed request | Log error, retry up to 2 times (3 total attempts) |
 | 401 | Authentication failed | Re-authenticate |
-| 403 | Access denied | Log error |
-| 404 | Unknown device/path | Log error |
+| 403 | Access denied | Log error, reset comms state |
+| 404 | Unknown device/path | Log error, reset comms state |
 | 5xx | Server error | Retry with exponential backoff |
 
 ### Connection errors
@@ -1374,6 +1374,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 1.4 | 2026-02-06 | Clarified 403/404 trigger comms reset (not just logging). |
 | 1.3 | 2026-02-06 | Marked `X-nl-longest-wake` header as vestigial (server ignores, never resets). |
 | 1.2 | 2026-02-05 | Added Authentication section (provisional) with device identification, credential types, credential loop warning, and recommended home server approach. Added Pairing section with user bucket mechanism. Fixed entry key `expires` type (must be JSON number, not string). Added user bucket to bucket types. Added device reboot note for full state sync. Expanded POST /entry response fields. Added device_alert_dialog bucket. |
 | 1.1 | 2026-02-05 | Added `if_object_revision` conditional write documentation. Clarified closing timer reset behavior and 7-second timeout context. Added JSON library field ordering implementation note. |
