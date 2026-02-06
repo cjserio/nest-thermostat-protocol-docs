@@ -2,8 +2,8 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 1.2
-**Last updated**: 2026-02-05
+**Revision**: 1.3
+**Last updated**: 2026-02-06
 
 ---
 
@@ -103,7 +103,7 @@ X-nl-protocol-version: 1
 |--------|----------|-------------|
 | `X-nl-protocol-version` | Yes | Protocol version. Always `1`. |
 | `X-nl-device-swversion` | No | Device software version string. |
-| `X-nl-longest-wake` | No | Analytics: device's longest awake duration in seconds. |
+| `X-nl-longest-wake` | No | Vestigial. Running max of subscribe connection durations (seconds); never resets. Server ignores. |
 | `X-nl-client-id` | No | Sent when device has no valid session. |
 
 #### Request body
@@ -1374,6 +1374,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 1.3 | 2026-02-06 | Marked `X-nl-longest-wake` header as vestigial (server ignores, never resets). |
 | 1.2 | 2026-02-05 | Added Authentication section (provisional) with device identification, credential types, credential loop warning, and recommended home server approach. Added Pairing section with user bucket mechanism. Fixed entry key `expires` type (must be JSON number, not string). Added user bucket to bucket types. Added device reboot note for full state sync. Expanded POST /entry response fields. Added device_alert_dialog bucket. |
 | 1.1 | 2026-02-05 | Added `if_object_revision` conditional write documentation. Clarified closing timer reset behavior and 7-second timeout context. Added JSON library field ordering implementation note. |
 | 1.0 | 2026-02-04 | Initial release. Subscribe, PUT, and entry endpoints. Response headers. Timing reference. Battery behavior. Bucket types. URL port requirement appendix. |
