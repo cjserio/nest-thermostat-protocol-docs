@@ -2,6 +2,9 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
+**Revision**: 1.1
+**Last updated**: 2026-02-05
+
 ---
 
 ## Table of contents
@@ -33,6 +36,7 @@ Protocol specification for implementing a server that communicates with Nest the
 - [Examples](#examples)
 - [Appendix: URL port requirement](#appendix-url-port-requirement)
 - [Document status](#document-status)
+- [Changelog](#changelog)
 
 ---
 
@@ -1143,3 +1147,12 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 | Authentication | TODO |
 | Bucket schemas | Complete |
 | Error handling | Partial |
+
+---
+
+## Changelog
+
+| Revision | Date | Changes |
+|----------|------|---------|
+| 1.1 | 2026-02-05 | Added `if_object_revision` conditional write documentation. Clarified closing timer reset behavior and 7-second timeout context. Added JSON library field ordering implementation note. |
+| 1.0 | 2026-02-04 | Initial release. Subscribe, PUT, and entry endpoints. Response headers. Timing reference. Battery behavior. Bucket types. URL port requirement appendix. |
