@@ -2,7 +2,7 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 1.1
+**Revision**: 1.2
 **Last updated**: 2026-02-05
 
 ---
@@ -14,6 +14,16 @@ Protocol specification for implementing a server that communicates with Nest the
   - [POST /{czid}/subscribe](#post-czidsubscribe)
   - [POST /{czid}/put](#post-czidput)
   - [POST /entry](#post-entry)
+- [Authentication (provisional)](#authentication-provisional)
+  - [Device identification](#device-identification)
+  - [Credential types](#credential-types)
+  - [Credential provisioning](#credential-provisioning)
+  - [Recommended approach for home servers](#recommended-approach-for-home-servers)
+  - [Entry key](#entry-key)
+- [Pairing](#pairing)
+  - [Pairing flow](#pairing-flow)
+  - [Complete pairing on the device](#complete-pairing-on-the-device)
+  - [Maintain pairing state across reconnections](#maintain-pairing-state-across-reconnections)
 - [Connection lifecycle](#connection-lifecycle)
   - [Server push wake mechanism](#server-push-wake-mechanism)
   - [Service tickle](#service-tickle-administrative-only)
@@ -375,6 +385,10 @@ Content-Type: application/json
 | Field | Required | Description |
 |-------|----------|-------------|
 | `transport_url` | Yes | Base URL for all subsequent API calls (`subscribe`, `put`). **Must include explicit port.** |
+| `passphrase_url` | No | Entry key fetch endpoint for device pairing. |
+| `ping_url` | No | Connectivity check endpoint. |
+| `weather_url` | No | Weather data endpoint. |
+| `upload_url` | No | Device log upload endpoint. |
 
 #### Device behavior after registration
 
@@ -397,6 +411,180 @@ Content-Type: application/json
 {
   "transport_url": "https://your-server.example.com:443"
 }
+```
+
+---
+
+## Authentication (provisional)
+
+> **Note**: The device's authentication and pairing system was designed for Google's cloud infrastructure and companion mobile app. That architecture handles credential provisioning, account linking, and pairing through a coordinated flow between the phone, cloud, and device — none of which exists in a home server deployment. The approaches documented here are functional but may not cover all firmware edge cases. If you encounter unexpected behavior, [file an issue](https://github.com/cjserio/nest-thermostat-protocol-docs/issues).
+
+Authentication is optional. The device supports HTTP Basic Authentication for subscribe and put requests, but you can also identify devices entirely through HTTP headers without provisioning credentials.
+
+### Device identification
+
+Even without credentials, the device identifies itself in every request through HTTP headers:
+
+| Header | Sent when | Found in |
+|--------|-----------|----------|
+| `X-nl-client-id` | Device has no valid credential session | Subscribe and PUT requests |
+| `X-nl-device-id` | Device has no valid credential session | Entry (frontdoor) requests |
+
+These headers contain the device serial number. They provide a reliable way to associate requests with a specific device without credentials.
+
+### Credential types
+
+The device has two credential modes:
+
+| Type | Description |
+|------|-------------|
+| Default | Built-in fallback credentials the device uses before your server provisions new ones. |
+| Assigned | Credentials your server provisions through the `X-nl-set-client-credentials` header. |
+
+The device uses assigned credentials for HTTP Basic Authentication once provisioned, and falls back to default credentials after an authentication failure.
+
+### Credential provisioning
+
+To provision credentials, include the `X-nl-set-client-credentials` header in any 200 response:
+
+```http
+X-nl-set-client-credentials: userid password
+```
+
+The format is space-separated `userid` and `password`. The device stores these values and uses them for HTTP Basic Authentication on subsequent requests.
+
+> **Warning**: Provisioning credentials through a 401 response can cause a credential loop on some firmware versions. The device receives the new credentials, then immediately falls back to default credentials before using them. This results in the device cycling between default and assigned credentials indefinitely. If you provision credentials, do so in 200 responses rather than 401 responses.
+
+### Recommended approach for home servers
+
+For home server deployments, the simplest and most reliable approach is to skip credential provisioning entirely:
+
+1. Accept all subscribe and put requests regardless of credentials.
+2. Identify devices by the `X-nl-client-id` or `X-nl-device-id` header.
+3. Look up the device serial in your database.
+
+This avoids credential management complexity and the credential loop described above.
+
+| Endpoint | Authentication required |
+|----------|------------------------|
+| `POST /entry` | No |
+| `POST /{czid}/subscribe` | No (identify by header) |
+| `POST /{czid}/put` | No (identify by header) |
+| `GET {passphrase_url}` | No |
+
+### Entry key
+
+During device pairing, users need an entry key displayed on the device screen. The device fetches this key from the `passphrase_url` endpoint specified in the `/entry` response.
+
+The entry key is separate from HTTP authentication. It verifies physical access to the device during initial setup.
+
+#### Request
+
+```http
+GET {passphrase_url} HTTP/1.1
+X-NL-Device-ID: 09AA01AB12345678
+```
+
+#### Response
+
+```json
+{
+  "value": "123ABCD",
+  "expires": 1707148800000
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `value` | string | 7-character alphanumeric code displayed on the device screen. |
+| `expires` | number | Expiration timestamp in milliseconds since Unix epoch. **Must be a JSON number, not a string.** |
+
+> **Warning**: The `expires` field must be a JSON number (for example, `1707148800000`). If you send it as a string (for example, `"1707148800000"`), the device silently rejects the response and never displays the entry key. The device also requires the expiration to be at least 30 minutes in the future.
+
+The device displays the entry key in `XXX-XXXX` format (for example, `123-ABCD`).
+
+#### Implement the entry key endpoint
+
+1. Generate a random 7-character alphanumeric code.
+2. Associate the code with the device serial from the `X-NL-Device-ID` header.
+3. Set an expiration time at least 30 minutes in the future (recommended: 1 hour).
+4. Return the code in the JSON response. Ensure `expires` is a JSON number.
+5. Validate the code when the user enters it in your application during pairing.
+
+---
+
+## Pairing
+
+After the user enters the entry key in your application, the server must complete pairing on the device. This dismisses the setup screen and transitions the device to normal operation.
+
+### Pairing flow
+
+```
+User                  Server                          Device
+  |                      |                               |
+  |                      |   [Device fetches entry key]  |
+  |                      |<--- GET {passphrase_url} -----|
+  |                      |--- {"value":"123ABCD"} ------>|
+  |                      |                               |
+  |   [User reads code   |                [Device shows  |
+  |    from device]      |                 "123-ABCD"]   |
+  |                      |                               |
+  |-- Enter code ------->|                               |
+  |                      |   [Server claims code,        |
+  |                      |    creates ownership record]  |
+  |                      |                               |
+  |                      |--- Push user bucket --------->|  (triggers pairing completion)
+  |                      |--- Push structure bucket ----->|  (establishes device-home link)
+  |                      |                               |
+  |                      |          [Pairing dialog      |
+  |                      |           dismisses]          |
+  |                      |                               |
+  |<-- "Paired!" --------|                               |
+```
+
+### Complete pairing on the device
+
+To dismiss the pairing screen, push two buckets to the device through the subscribe connection:
+
+1. **User bucket** — This is the critical piece. When the device receives a user bucket with a `name` field, it records the value as its pairing token and triggers pairing completion internally. Without this bucket, the pairing screen remains visible.
+
+2. **Structure bucket** — This establishes the association between the device and a home/structure. The device uses it for home-level settings like away mode.
+
+Push both buckets together in a single subscribe response:
+
+```json
+{
+  "objects": [
+    {
+      "object_revision": 1,
+      "object_timestamp": 1707148800000,
+      "object_key": "user.your_user_id",
+      "value": {
+        "name": "your_user_id"
+      }
+    },
+    {
+      "object_revision": 1,
+      "object_timestamp": 1707148800000,
+      "object_key": "structure.your_structure_id",
+      "value": {
+        "name": "Home",
+        "devices": ["09AA01AB12345678"]
+      }
+    }
+  ]
+}
+```
+
+> **Important**: The user bucket's `name` field is what completes pairing. The structure bucket alone is not sufficient — the device checks for an existing pairing token before processing structure updates, and that token doesn't exist until the user bucket provides it.
+
+### Maintain pairing state across reconnections
+
+Include both the user bucket and structure bucket in subscribe responses for paired devices on every reconnection, not just at registration time. The device may reboot, lose state, or reconnect to a freshly started server. Consistently including these buckets ensures pairing state is always current.
+
+When the device already has the latest version of a bucket (matching timestamp), it ignores the duplicate. There is no penalty for including them.
+
+> **Note**: After a fresh server start or device reboot, the device may only send partial state updates. Reboot the device after starting a new server for the first time to force a full state sync. During a reboot, the device re-initializes all of its data fields and uploads its complete state.
 
 ---
 
@@ -911,14 +1099,23 @@ Use this bucket for device configuration and to read current sensor values.
 | `hvac_heater_state` | boolean | No | Heater running |
 | `hvac_fan_state` | boolean | No | Fan running |
 
+### user bucket
+
+Use this bucket to complete pairing. See [Pairing](#pairing) for details.
+
+| Field | Type | Writable | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | User identifier. Triggers pairing completion on the device. |
+
 ### structure bucket
 
-Use this bucket for home-level settings.
+Use this bucket for home-level settings and device-structure association.
 
 | Field | Type | Writable | Description |
 |-------|------|----------|-------------|
 | `away` | boolean | Yes | Away mode enabled |
 | `name` | string | Yes | Structure name |
+| `devices` | array | Yes | List of device serials belonging to this structure |
 | `postal_code` | string | Yes | Postal/ZIP code |
 | `time_zone` | string | Yes | Timezone identifier |
 
@@ -929,6 +1126,22 @@ Use this bucket for home-level settings.
 | `schedule` | Heating/cooling schedules |
 | `where` | Room/location assignments |
 | `message` | In-app messages |
+
+### device_alert_dialog bucket
+
+Use this bucket for server-initiated dialog prompts displayed on the device.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `dialog_id` | string | Dialog type identifier |
+| `dialog_data` | string | Dialog payload data |
+| `msg_id` | string | Message identifier |
+| `active` | boolean | Whether the dialog is active |
+| `choices` | string | User choice options |
+| `callback_url` | string | Response callback URL |
+| `timeout` | integer | Dialog timeout in seconds |
+
+To display a dialog, push a `dialog_id` value. To dismiss the dialog, clear or empty `dialog_id`.
 
 ---
 
@@ -980,6 +1193,10 @@ Use this bucket for home-level settings.
 - [ ] Treat timestamp=0 as "no data" sentinel
 - [ ] Ensure `object_revision` and `object_timestamp` appear BEFORE `object_key` in JSON responses
 - [ ] Include `X-nl-service-timestamp` header in responses (milliseconds since epoch)
+- [ ] Implement entry key endpoint with `expires` as a JSON number (not string)
+- [ ] Push user bucket (with `name` field) to complete pairing
+- [ ] Push structure bucket to establish device-home association
+- [ ] Include user and structure buckets on every subscribe for paired devices
 
 ### Recommended
 
@@ -1002,6 +1219,8 @@ Use this bucket for home-level settings.
 - [ ] Setting aggressive idle timeouts
 - [ ] Sending `object_key` before `object_revision`/`object_timestamp` in JSON responses
 - [ ] Using revision for sync decisions (use timestamp instead)
+- [ ] Sending entry key `expires` as a JSON string (must be a number)
+- [ ] Provisioning credentials through 401 responses (can cause credential loop)
 
 ---
 
@@ -1144,7 +1363,8 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 | Battery behavior | Complete |
 | Versioning and synchronization | Complete |
 | Entry endpoint | Complete |
-| Authentication | TODO |
+| Authentication | Provisional |
+| Pairing | Complete |
 | Bucket schemas | Complete |
 | Error handling | Partial |
 
@@ -1154,5 +1374,6 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 1.2 | 2026-02-05 | Added Authentication section (provisional) with device identification, credential types, credential loop warning, and recommended home server approach. Added Pairing section with user bucket mechanism. Fixed entry key `expires` type (must be JSON number, not string). Added user bucket to bucket types. Added device reboot note for full state sync. Expanded POST /entry response fields. Added device_alert_dialog bucket. |
 | 1.1 | 2026-02-05 | Added `if_object_revision` conditional write documentation. Clarified closing timer reset behavior and 7-second timeout context. Added JSON library field ordering implementation note. |
 | 1.0 | 2026-02-04 | Initial release. Subscribe, PUT, and entry endpoints. Response headers. Timing reference. Battery behavior. Bucket types. URL port requirement appendix. |
