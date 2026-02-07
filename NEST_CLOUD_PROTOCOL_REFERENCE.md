@@ -2,8 +2,8 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 1.4
-**Last updated**: 2026-02-06
+**Revision**: 1.5
+**Last updated**: 2026-02-07
 
 ---
 
@@ -136,8 +136,8 @@ X-nl-service-timestamp: 1707148800000
 | `X-nl-suspend-time-max` | Yes | Maximum seconds before device will reconnect. See [Suspend Time](#x-nl-suspend-time-max). |
 | `X-nl-service-timestamp` | Recommended | Server timestamp in milliseconds since Unix epoch. Used for sync decisions. |
 | `X-nl-set-client-credentials` | No | Set device credentials as `"userid password"`. |
-| `X-nl-defer-device-window` | No | Delay window for device-initiated updates. See [Setpoint Jitter](#setpoint-jitter-optimization). |
-| `X-nl-disable-defer-window` | No | Temporarily disable defer delay. See [Setpoint Jitter](#setpoint-jitter-optimization). |
+| `X-nl-defer-device-window` | No | Delay window for device-initiated updates. See [X-nl-defer-device-window](#x-nl-defer-device-window). |
+| `X-nl-disable-defer-window` | No | Temporarily disable defer delay. See [X-nl-defer-device-window](#x-nl-defer-device-window). |
 
 #### Response body
 
@@ -425,12 +425,12 @@ Authentication is optional. The device supports HTTP Basic Authentication for su
 
 Even without credentials, the device identifies itself in every request through HTTP headers:
 
-| Header | Sent when | Found in |
-|--------|-----------|----------|
-| `X-nl-client-id` | Device has no valid credential session | Subscribe and PUT requests |
-| `X-nl-device-id` | Device has no valid credential session | Entry (frontdoor) requests |
+| Header | Format | Sent when | Found in |
+|--------|--------|-----------|----------|
+| `X-nl-client-id` | `d.{SERIAL}.{random}` | Device has no valid credential session | Subscribe and PUT requests |
+| `X-nl-device-id` | `{SERIAL}` (bare serial) | Device has no valid credential session | Entry (frontdoor) requests |
 
-These headers contain the device serial number. They provide a reliable way to associate requests with a specific device without credentials.
+Both headers identify the device by serial number. `X-nl-device-id` is the bare serial. `X-nl-client-id` requires parsing — extract the second dot-delimited segment to get the serial (e.g., `d.09AA01AB12345678.BC7C9039` → `09AA01AB12345678`).
 
 ### Credential types
 
@@ -510,6 +510,8 @@ The device displays the entry key in `XXX-XXXX` format (for example, `123-ABCD`)
 3. Set an expiration time at least 30 minutes in the future (recommended: 1 hour).
 4. Return the code in the JSON response. Ensure `expires` is a JSON number.
 5. Validate the code when the user enters it in your application during pairing.
+
+> **Note**: The device polls this endpoint repeatedly until pairing completes. Return the same unexpired key on each request rather than generating a new one, otherwise the key is invalidated before the user can enter it.
 
 ---
 
@@ -742,7 +744,7 @@ A timestamp of `0` is a special sentinel value meaning "no data exists on server
 **Revision** (`object_revision`):
 - Incremented on every write operation
 - Used **only** for conditional writes (`if_object_revision`)
-- If `if_object_revision` is provided in a PUT request and doesn't match the server's current revision, the server returns **409 Conflict**
+- If `if_object_revision` is provided in a PUT request and doesn't match the server's current revision, the server should reject the write (the specific error response is implementation-defined)
 - `base_object_revision` in PUT requests is informational only (no validation)
 
 **Timestamp** (`object_timestamp`):
@@ -755,7 +757,7 @@ A timestamp of `0` is a special sentinel value meaning "no data exists on server
 
 | Field | Purpose | Used For |
 |-------|---------|----------|
-| `object_revision` | Write ordering | Conditional writes (409 on mismatch) |
+| `object_revision` | Write ordering | Conditional writes (reject on mismatch) |
 | `object_timestamp` | Sync authority | Determining newer data |
 | `if_object_revision` | Conditional write guard | PUT validation |
 | `base_object_revision` | Informational | Debugging/logging (no validation) |
@@ -872,7 +874,7 @@ X-nl-suspend-time-max: 600
 X-nl-service-timestamp: 1707148800000
 X-nl-disable-defer-window: 60
 
-{"shared": {"object_revision": 458, "object_timestamp": 1707148800000, "object_key": "shared.SERIAL", "value": {"target_temperature": 72.0}}}
+{"objects": [{"object_revision": 458, "object_timestamp": 1707148800000, "object_key": "shared.09AA01AB12345678", "value": {"target_temperature": 22.0, "target_change_pending": true}}]}
 ```
 
 For the next 60 seconds, any local changes also send immediately.
@@ -1374,6 +1376,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 1.5 | 2026-02-07 | Documented `X-nl-client-id` header format (`d.{SERIAL}.{random}`). Added entry key polling note (server must return same unexpired key). Fixed broken anchor links for defer-device-window. Fixed `if_object_revision` contradiction (now consistently "implementation-defined"). Fixed subscribe example to use `objects` array format. |
 | 1.4 | 2026-02-06 | Clarified 403/404 trigger comms reset (not just logging). |
 | 1.3 | 2026-02-06 | Marked `X-nl-longest-wake` header as vestigial (server ignores, never resets). |
 | 1.2 | 2026-02-05 | Added Authentication section (provisional) with device identification, credential types, credential loop warning, and recommended home server approach. Added Pairing section with user bucket mechanism. Fixed entry key `expires` type (must be JSON number, not string). Added user bucket to bucket types. Added device reboot note for full state sync. Expanded POST /entry response fields. Added device_alert_dialog bucket. |
