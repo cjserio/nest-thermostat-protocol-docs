@@ -2,7 +2,7 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 2.0
+**Revision**: 2.1
 **Last updated**: 2026-02-08
 **Author**: Chris Serio
 
@@ -55,6 +55,13 @@ Protocol specification for implementing a server that communicates with Nest the
   - [Display wake behavior](#display-wake-behavior)
   - [Write protection](#write-protection)
   - [Schedule sync guards](#schedule-sync-guards)
+- [Thermostat control](#thermostat-control)
+  - [State model](#state-model)
+  - [HVAC modes](#hvac-modes)
+  - [Set the temperature](#set-the-temperature)
+  - [Read device state](#read-device-state)
+  - [Feature reference](#feature-reference)
+  - [State interactions](#state-interactions)
 - [Home/Away mode](#homeaway-mode)
   - [Set away mode](#set-away-mode)
   - [Set home mode](#set-home-mode)
@@ -1186,11 +1193,6 @@ These fields appear in PUT requests. Store them, but don't try to overwrite them
 | `has_fan` | boolean | Fan control available |
 | `has_humidifier` | boolean | Humidifier detected |
 | `has_dehumidifier` | boolean | Dehumidifier detected |
-| `hvac_ac_state` | boolean | Air conditioning running |
-| `hvac_heater_state` | boolean | Heater running |
-| `hvac_fan_state` | boolean | Fan running |
-| `hvac_aux_heater_state` | boolean | Auxiliary heater running |
-| `hvac_emer_heat_state` | boolean | Emergency heat running |
 | `leaf` | boolean | Leaf icon displayed (energy-saving indicator) |
 | `auto_away` | integer | Occupancy sensor state: `0` = home, `1` = away |
 | `time_to_target` | integer | Estimated seconds to reach target temperature |
@@ -1349,11 +1351,22 @@ Controls the active temperature setpoint and HVAC mode. This is the primary buck
 | `target_temperature` | float | Read/write | Target temperature in Celsius |
 | `target_temperature_high` | float | Read/write | Upper bound in range mode (Celsius) |
 | `target_temperature_low` | float | Read/write | Lower bound in range mode (Celsius) |
-| `target_temperature_type` | string | Read/write | HVAC mode: `heat`, `cool`, `range`, or `off` |
+| `target_temperature_type` | string | Read/write | HVAC mode: `heat`, `cool`, `range`, `emergency`, or `off`. See [HVAC modes](#hvac-modes). |
 | `target_change_pending` | boolean | Read/write | Pending temperature change flag. See [Display wake behavior](#display-wake-behavior). |
 | `schedule_mode` | string | Read/write | Active schedule mode: `HEAT`, `COOL`, or `RANGE`. See [Temperature schedules](#temperature-schedules). |
 | `can_heat` | boolean | Read | Device supports heating |
 | `can_cool` | boolean | Read | Device supports cooling |
+| `hvac_heater_state` | boolean | Read | Primary heater running |
+| `hvac_heat_x2_state` | boolean | Read | Stage 2 heat running |
+| `hvac_heat_x3_state` | boolean | Read | Stage 3 heat running |
+| `hvac_aux_heater_state` | boolean | Read | Auxiliary heater running |
+| `hvac_alt_heat_state` | boolean | Read | Alternate heat source running |
+| `hvac_alt_heat_x2_state` | boolean | Read | Alternate heat stage 2 running |
+| `hvac_emer_heat_state` | boolean | Read | Emergency heat running |
+| `hvac_ac_state` | boolean | Read | Air conditioning running |
+| `hvac_cool_x2_state` | boolean | Read | Stage 2 cooling running |
+| `hvac_cool_x3_state` | boolean | Read | Stage 3 cooling running |
+| `hvac_fan_state` | boolean | Read | Fan running |
 | `name` | string | Read/write | Device display name |
 
 #### Temperature precision
@@ -1623,6 +1636,422 @@ When the device sends a PUT with multiple buckets, they appear in this order:
 `demand_response` &rarr; `demand_response_event` &rarr; `tuneups` &rarr; `structure` &rarr; `schedule` &rarr; `custom_schedule` &rarr; `message` &rarr; `shared` &rarr; `device` &rarr; `where` &rarr; `diamond_sensor_event` &rarr; `tou` &rarr; `hvac_partner` &rarr; `cloud_algo` &rarr; `demand_charge_event` &rarr; `rcs_settings` &rarr; `kryptonite` &rarr; `diagnostics`
 
 The server doesn't need to process them in order. This is documented for debugging.
+
+---
+
+## Thermostat control
+
+The previous sections cover the transport protocol and data model. This section explains how to use those primitives to control the thermostat — setting modes, changing temperatures, reading state, and configuring features.
+
+For eco mode (home/away) control, see [Home/Away mode](#homeaway-mode). For schedule management, see [Temperature schedules](#temperature-schedules).
+
+### State model
+
+The thermostat's state isn't a single "mode." It's the combination of four independent dimensions, each controlled through different bucket fields.
+
+The following table summarizes the four dimensions.
+
+| Dimension | What it controls | Bucket | Key field | Settable by server? |
+|-----------|-----------------|--------|-----------|---------------------|
+| HVAC mode | Heating, cooling, or both | Shared | `target_temperature_type` | Yes |
+| Temperature setpoint | Target temperature | Shared | `target_temperature` (and variants) | Yes |
+| Eco mode | Home/away energy state | Structure | `manual_eco_all` | Yes |
+| HVAC operation | What hardware is running | Shared | `hvac_*_state` fields | No (read-only) |
+
+These dimensions are independent — changing one doesn't reset the others:
+
+- Setting `target_temperature_type` to `"off"` preserves the previous HVAC mode internally. Setting it back to `"heat"` resumes where it left off.
+- Activating eco mode doesn't change the HVAC mode or schedule. When eco ends, the previous setpoints resume.
+- The HVAC operation state is a consequence of the other dimensions — the server observes it but can't set it directly.
+
+### HVAC modes
+
+The HVAC mode determines whether the thermostat heats, cools, or does both. Set it by pushing `target_temperature_type` in the [shared bucket](#shared-bucket).
+
+The following table lists the supported values.
+
+| Value | Behavior | Temperature fields used | Wiring required |
+|-------|----------|------------------------|-----------------|
+| `"heat"` | Heating only | `target_temperature` | `can_heat` |
+| `"cool"` | Cooling only | `target_temperature` | `can_cool` |
+| `"range"` | Automatic heat and cool | `target_temperature_low`, `target_temperature_high` | `can_heat` and `can_cool` |
+| `"off"` | All HVAC disabled | None | — |
+| `"emergency"` | Emergency/auxiliary heat | `target_temperature` | `has_emer_heat` (device bucket) |
+
+Values are case-insensitive. The device sends lowercase in PUT requests.
+
+#### Validate mode against capabilities
+
+Before setting a mode, check the device's wiring capabilities. The `can_heat` and `can_cool` fields are in the [shared bucket](#shared-bucket). The `has_emer_heat` field is in the [device bucket](#device-bucket).
+
+If you push a mode the device's wiring can't support, the device silently falls back to a supported mode — preferring heat over cool. Check capabilities before offering modes in a UI to avoid confusing the user.
+
+#### Emergency heat
+
+Emergency heat bypasses the heat pump compressor and runs the auxiliary heater directly. This is expensive and intended for equipment failure or extreme cold.
+
+When emergency heat activates, the device automatically:
+
+- Saves and disables learning mode.
+- Saves and disables auto-away.
+- Blocks preconditioning entirely.
+- Restores all saved settings when emergency heat is turned off.
+
+Don't leave a device in emergency heat long-term. It significantly increases energy costs.
+
+#### Example: set HVAC mode
+
+```json
+{
+  "objects": [
+    {
+      "object_revision": 460,
+      "object_timestamp": 1707148800000,
+      "object_key": "shared.09AA01AB12345678",
+      "value": {
+        "target_temperature_type": "cool"
+      }
+    }
+  ]
+}
+```
+
+> **Note:** Remember that `object_revision` and `object_timestamp` must appear before `object_key` in the JSON. See [Response format](#response-body).
+
+### Set the temperature
+
+Which temperature fields to set depends on the active HVAC mode. For the complete field list, see [shared bucket](#shared-bucket).
+
+#### Single-setpoint modes
+
+In `heat`, `cool`, or `emergency` mode, set `target_temperature`:
+
+```json
+{
+  "objects": [
+    {
+      "object_revision": 461,
+      "object_timestamp": 1707148800000,
+      "object_key": "shared.09AA01AB12345678",
+      "value": {
+        "target_temperature": 21.5,
+        "target_change_pending": true
+      }
+    }
+  ]
+}
+```
+
+#### Dual-setpoint mode
+
+In `range` mode, set both `target_temperature_low` (heating threshold) and `target_temperature_high` (cooling threshold):
+
+```json
+{
+  "objects": [
+    {
+      "object_revision": 461,
+      "object_timestamp": 1707148800000,
+      "object_key": "shared.09AA01AB12345678",
+      "value": {
+        "target_temperature_low": 18.0,
+        "target_temperature_high": 24.0,
+        "target_change_pending": true
+      }
+    }
+  ]
+}
+```
+
+The device heats when the current temperature drops below `target_temperature_low` and cools when it rises above `target_temperature_high`.
+
+#### Temperature encoding and limits
+
+All temperatures across all buckets are **Celsius floats** — for example, `21.5`. The device converts for display based on the `temperature_scale` field in the device bucket. See [Temperature values](#temperature-values).
+
+The following table summarizes the valid range.
+
+| Property | Value |
+|----------|-------|
+| Unit | Celsius |
+| Format | Float (for example, `21.5`) |
+| Recommended range | 4.5 °C – 32.0 °C (40 °F – 90 °F) |
+| Device-accepted range | ~2.0 °C – 58.0 °C |
+| Precision | ~0.01 °C minimum meaningful increment |
+
+#### Display wake
+
+Include `target_change_pending: true` whenever you push a temperature change. This wakes the physical display and plays the temperature animation. See [Display wake behavior](#display-wake-behavior) for the acknowledgment flow.
+
+### Read device state
+
+The device reports its state through read-only fields in PUT requests. Store these values and use them to drive your UI and automation logic.
+
+#### Current conditions
+
+| Field | Bucket | Type | Description |
+|-------|--------|------|-------------|
+| `current_temperature` | Device | float | Indoor temperature (°C) |
+| `current_humidity` | Device | integer | Indoor relative humidity (%) |
+| `backplate_temperature` | Device | float | Backplate temperature (°C) |
+| `battery_level` | Device | float | Battery charge level (0.0–1.0) |
+
+#### Equipment capabilities
+
+Check these fields before offering controls in a UI.
+
+| Field | Bucket | Type | Description |
+|-------|--------|------|-------------|
+| `can_heat` | Shared | boolean | Heating wiring detected |
+| `can_cool` | Shared | boolean | Cooling wiring detected |
+| `has_emer_heat` | Device | boolean | Emergency/auxiliary heat wiring detected |
+| `has_fan` | Device | boolean | Fan control wiring detected |
+| `has_humidifier` | Device | boolean | Humidifier wiring detected |
+| `has_dehumidifier` | Device | boolean | Dehumidifier wiring detected |
+| `has_hot_water_control` | Device | boolean | Hot water system detected (UK/EU) |
+
+#### HVAC operation
+
+The [shared bucket](#shared-bucket) contains individual boolean fields for each wire relay. Use them to determine what equipment is currently running.
+
+The following table maps equipment categories to their state fields.
+
+| Currently... | Check these shared bucket fields |
+|-------------|----------------------------------|
+| Heating | `hvac_heater_state`, `hvac_heat_x2_state`, `hvac_heat_x3_state` |
+| Cooling | `hvac_ac_state`, `hvac_cool_x2_state`, `hvac_cool_x3_state` |
+| Emergency heating | `hvac_emer_heat_state` |
+| Auxiliary/alternate heat | `hvac_aux_heater_state`, `hvac_alt_heat_state`, `hvac_alt_heat_x2_state` |
+| Fan running | `hvac_fan_state` |
+
+If any field in a category is `true`, that equipment type is active. Multiple fields can be `true` simultaneously — for example, stage 1 and stage 2 heating.
+
+#### Eco state
+
+The device reports its eco mode through the `eco_mode` field in the device bucket. This is a read-only JSON string:
+
+```json
+{"mode":"manual-eco","touched_by":3,"mode_update_timestamp":1738800000,"touched_user_id":"userId"}
+```
+
+The `mode` value is one of:
+
+| Value | Meaning |
+|-------|---------|
+| `"schedule"` | Normal operation (home) |
+| `"auto-eco"` | Occupancy-driven eco (unreliable — see [Why not the away field?](#why-not-the-away-field)) |
+| `"manual-eco"` | Server-set eco (reliable — set through `manual_eco_all`) |
+
+For controlling eco mode, see [Home/Away mode](#homeaway-mode).
+
+#### Time to target
+
+| Field | Bucket | Type | Description |
+|-------|--------|------|-------------|
+| `time_to_target` | Device | integer | Estimated seconds until the target temperature is reached. `0` when at target. |
+| `time_to_target_training` | Device | string | `"ready"` when estimates are calibrated, `"training"` while calibrating, `"not_ready"` when no estimates are available. |
+
+### Feature reference
+
+The device supports independent features that overlay on the core state model. Each feature can be enabled or disabled through fields in the [device bucket](#device-bucket). This section describes what each feature does and its key fields. For the complete field list, see the [cloud-writable fields](#cloud-writable-fields) tables.
+
+#### Fan control
+
+Controls the HVAC fan independently of heating and cooling.
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `fan_mode` | Bidirectional | string | `"off"`, `"auto"`, or `"duty-cycle"` |
+| `fan_timer_duration` | Bidirectional | integer | Fan timer length in seconds |
+| `fan_timer_timeout` | Bidirectional | integer | Fan timer end time (Unix timestamp). Set to `0` to stop the timer. |
+| `fan_duty_cycle` | Bidirectional | integer | Minutes per hour the fan runs in duty-cycle mode |
+| `fan_cooling_enabled` | Server → device | boolean | Enable Airwave — runs the fan with residual cold from the AC coil to save compressor energy |
+| `fan_cooling_state` | Device → server | string | Current Airwave state |
+
+To start a fan timer, set both `fan_timer_duration` and `fan_timer_timeout`. Check `has_fan` before showing fan controls.
+
+#### Safety temperature
+
+Forces heating or cooling when the indoor temperature crosses a threshold, **regardless of all other state** — including system off, eco mode, and the active schedule. Safety temperatures are the highest-priority override.
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `upper_safety_temp` | Bidirectional | float | Cool activates above this temperature (°C) |
+| `upper_safety_temp_enabled` | Bidirectional | boolean | Enable the high threshold |
+| `lower_safety_temp` | Bidirectional | float | Heat activates below this temperature (°C) |
+| `lower_safety_temp_enabled` | Bidirectional | boolean | Enable the low threshold |
+| `safety_state` | Device → server | string | `"safe"`, `"below"`, or `"above"` |
+| `safety_temp_activating_hvac` | Device → server | boolean | Safety override is currently running HVAC |
+
+When any safety field changes, the device forces four additional fields into its next PUT regardless of whether they changed: `battery_level`, `safety_temp_activating_hvac`, `safety_state`, and `safety_state_time`. See [Safety fields](#safety-fields).
+
+#### Temperature lock
+
+Locks the physical dial to prevent unauthorized temperature changes. The device requires a PIN to unlock.
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `temperature_lock` | Server → device | boolean | Enable the lock |
+| `temperature_lock_pin_hash` | Bidirectional | string | PIN hash for unlocking |
+| `temperature_lock_low_temp` | Bidirectional | float | Minimum allowed temperature when locked (°C) |
+| `temperature_lock_high_temp` | Bidirectional | float | Maximum allowed temperature when locked (°C) |
+
+When locked, the user can still adjust the temperature on the dial but only within the bounds you set.
+
+#### Preconditioning
+
+Starts heating or cooling early so the home reaches the target temperature at the scheduled transition time. The server can enable or disable it but can't trigger it directly — the device calculates when to start based on thermal history.
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `preconditioning_enabled` | Server → device | boolean | Enable early-start scheduling |
+| `preconditioning_ready` | Device → server | boolean | Feature is ready (has enough thermal data) |
+| `eta_preconditioning_active` | Device → server | boolean | Currently preconditioning |
+| `max_nighttime_preconditioning_seconds` | Bidirectional | integer | Maximum preconditioning duration at night (seconds) |
+
+> **Note:** Preconditioning is automatically blocked during manual eco mode. This is the mechanism that makes `manual_eco_all` reliable for away control — see [Home/Away mode](#homeaway-mode).
+
+#### Learning mode
+
+The auto-schedule feature learns from the user's manual temperature adjustments and modifies the schedule over time.
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `learning_mode` | Bidirectional | boolean | Auto-schedule learning enabled |
+| `schedule_learning_reset` | Server → device | boolean | Reset all learned schedule data |
+
+Learning pauses automatically during eco mode and emergency heat.
+
+> **Note:** When learning is enabled, the device may modify a schedule you pushed. If you need the schedule to remain exactly as pushed, disable learning first.
+
+#### Humidity control
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `target_humidity` | Bidirectional | float | Target humidity percentage |
+| `target_humidity_enabled` | Bidirectional | boolean | Enable humidity targeting |
+| `current_humidity` | Device → server | integer | Current humidity reading (%) |
+| `auto_dehum_enabled` | Server → device | boolean | Enable automatic dehumidification |
+| `humidifier_type` | Bidirectional | string | Humidifier type |
+| `dehumidifier_type` | Bidirectional | string | Dehumidifier type |
+
+Check `has_humidifier` and `has_dehumidifier` before showing humidity controls.
+
+#### Sunblock
+
+Compensates for direct sunlight on the temperature sensor by adjusting the reading.
+
+| Field | Direction | Description |
+|-------|-----------|-------------|
+| `sunlight_correction_enabled` | Bidirectional | Enable sunlight compensation |
+| `sunlight_correction_active` | Device → server | Sunlight currently detected on sensor |
+| `sunlight_correction_ready` | Device → server | Feature has enough data to operate |
+
+#### Heat pump balance
+
+Controls the tradeoff between energy savings and comfort for heat pump systems.
+
+| Field | Direction | Values |
+|-------|-----------|--------|
+| `heatpump_savings` | Bidirectional | `"max-savings"`, `"balanced"`, or `"max-comfort"` |
+
+#### Radiant heat
+
+Optimizes control for radiant/underfloor heating systems by accounting for their slower thermal response time.
+
+| Field | Direction | Type |
+|-------|-----------|------|
+| `radiant_control_enabled` | Bidirectional | boolean |
+
+#### Hot water (UK/EU)
+
+For Heat Link systems with domestic hot water control.
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `hot_water_mode` | Bidirectional | string | `"schedule"` or `"off"` |
+| `hot_water_boost_time_to_end` | Bidirectional | integer | Boost timer end (Unix timestamp) |
+| `hot_water_active` | Device → server | boolean | Hot water currently heating |
+| `hot_water_away_enabled` | Bidirectional | boolean | Allow hot water during eco mode |
+
+Check `has_hot_water_control` before showing hot water controls.
+
+#### Smoke and CO safety shutoff
+
+Integrates with Nest Protect devices to shut off HVAC when smoke or CO is detected.
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `smoke_safety_shutoff_enabled` | Bidirectional | boolean | Enable smoke-triggered HVAC shutoff |
+| `safety_shutoff_enabled` | Bidirectional | boolean | Enable CO-triggered HVAC shutoff |
+| `hvac_smoke_safety_shutoff_active` | Device → server | boolean | HVAC currently shut off due to smoke |
+| `hvac_safety_shutoff_active` | Device → server | boolean | HVAC currently shut off due to CO |
+
+#### Compressor lockout
+
+Prevents the compressor from short-cycling by enforcing a minimum off time between cycles.
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `compressor_lockout_enabled` | Bidirectional | boolean | Enable compressor lockout |
+| `compressor_lockout_timeout` | Bidirectional | integer | Minimum off time in seconds |
+
+#### Display and sound
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `farsight_screen` | Bidirectional | string | What the display shows on standby |
+| `should_wake_on_approach` | Bidirectional | boolean | Wake the display when someone approaches |
+| `click_sound` | Bidirectional | boolean | Audible click on dial turn |
+| `temperature_scale` | Bidirectional | string | Display unit: `"F"` or `"C"`. Display-only — all data is always Celsius. |
+
+#### Leaf thresholds
+
+The green leaf icon appears when the current setpoint is energy-efficient. The server can adjust the thresholds.
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `leaf_threshold_heat` | Bidirectional | float | Leaf appears below this heating setpoint (°C) |
+| `leaf_threshold_cool` | Bidirectional | float | Leaf appears above this cooling setpoint (°C) |
+| `leaf_away_low` | Bidirectional | float | Eco heating threshold for leaf (°C) |
+| `leaf_away_high` | Bidirectional | float | Eco cooling threshold for leaf (°C) |
+| `leaf` | Device → server | boolean | Whether the leaf icon is currently displayed |
+
+#### Filter reminder
+
+| Field | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `filter_reminder_enabled` | Server → device | boolean | Enable filter change reminders |
+| `filter_changed_date` | Bidirectional | integer | Last filter change (Unix timestamp) |
+| `filter_replacement_needed` | Device → server | boolean | Filter needs replacement |
+| `filter_runtime_sec` | Device → server | integer | Total filter runtime in seconds |
+
+### State interactions
+
+The four state dimensions operate independently, but some combinations produce specific behaviors. The following table describes how common server actions affect the device.
+
+| Server action | HVAC mode | Temperature source | Eco mode | HVAC runs? |
+|--------------|-----------|-------------------|----------|------------|
+| Set `target_temperature_type` to `"heat"` | → Heat | Schedule or manual setpoint | Unchanged | If below setpoint |
+| Set `target_temperature_type` to `"off"` | → Off | — | Unchanged | No |
+| Set `manual_eco_all` to `true` | Unchanged | → Eco temperatures | → Manual-eco | Only outside eco band |
+| Set `manual_eco_all` to `false` | Unchanged | → Schedule or manual setpoint | → Schedule | If below/above setpoint |
+| Push a new schedule | Unchanged | Updated for future transitions | Unchanged | Recalculated |
+| Safety threshold crossed | Overridden | Overridden | Overridden | Forced on |
+| Emergency mode set | → Emergency | Manual setpoint | Unchanged | Emergency heat |
+| User turns dial | Unchanged | → Manual setpoint | Eco reverts to schedule | Recalculated |
+
+#### Eco mode and feature interactions
+
+Several features change behavior during eco mode.
+
+| Feature | Normal operation | During eco mode |
+|---------|-----------------|-----------------|
+| Preconditioning | Runs normally | **Blocked** (manual-eco only) |
+| Schedule following | Active | Suspended — eco temperatures used instead |
+| Learning | Active | Paused |
+| Safety temperature | Active | Active — overrides eco |
+| Fan timer | Active | Active |
 
 ---
 
@@ -2087,6 +2516,9 @@ If you need the schedule to remain exactly as pushed, the user must disable the 
 - [ ] Push complete schedules (all days, all setpoints), not partial updates
 - [ ] Use Celsius for all schedule temperatures (device converts for display)
 - [ ] Use day indexing 0=Monday through 6=Sunday in schedule JSON
+- [ ] Validate HVAC mode against device capabilities (`can_heat`, `can_cool`, `has_emer_heat`) before pushing
+- [ ] Use the correct temperature fields for the active mode (`target_temperature` for single-setpoint, `target_temperature_low`/`target_temperature_high` for range)
+- [ ] Store all device-reported read-only fields from PUT requests (sensor data, HVAC states, capabilities)
 
 ### Recommended
 
@@ -2102,6 +2534,10 @@ If you need the schedule to remain exactly as pushed, the user must disable the 
 - [ ] Accept PUTs at any time, even while subscribe connections are open
 - [ ] Wait at least 15 seconds after pushing a schedule before pushing another (debounce)
 - [ ] Serve schedule bucket on subscribe when device requests it
+- [ ] Check `has_fan`, `has_humidifier`, `has_dehumidifier`, `has_hot_water_control` before showing feature controls
+- [ ] Report `safety_state` and `hvac_*_state` fields in your UI so users can see what's running
+- [ ] Store `time_to_target` and `time_to_target_training` for estimated arrival time in UI
+- [ ] Expose safety temperature, temperature lock, and learning mode as user-configurable settings
 
 ### Avoid
 
@@ -2119,6 +2555,9 @@ If you need the schedule to remain exactly as pushed, the user must disable the 
 - [ ] Using Fahrenheit in schedule temperature values — always use Celsius
 - [ ] Pushing schedules rapidly without waiting for the 15-second debounce window
 - [ ] Assuming Sunday=0 for schedule days — 0 is Monday
+- [ ] Pushing `target_temperature_type` values without checking `can_heat`/`can_cool` (device falls back silently)
+- [ ] Writing to device-only fields like `current_temperature` or `hvac_*_state` (device overwrites your values)
+- [ ] Leaving a device in emergency heat long-term (high energy cost, disables learning and auto-away)
 
 ---
 
@@ -2265,6 +2704,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 | Pairing | Complete |
 | Bucket types | Complete |
 | Home/Away mode | Complete |
+| Thermostat control | Complete |
 | Temperature schedules | Complete |
 | Error handling | Partial |
 
@@ -2274,6 +2714,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.1 | 2026-02-08 | Added Thermostat control section: four-axis state model, HVAC modes (heat/cool/range/off/emergency) with validation against wiring capabilities, temperature setpoint control (single and dual setpoint with examples), device state reading guide (current conditions, equipment capabilities, HVAC operation mapping, eco state, time-to-target), comprehensive feature reference (fan, safety temperature, temperature lock, preconditioning, learning, humidity, sunblock, heat pump balance, radiant heat, hot water, smoke/CO safety shutoff, compressor lockout, display/sound, leaf thresholds, filter reminder), and state interaction matrix. Added `emergency` to shared bucket `target_temperature_type` values. Updated implementation checklist with mode validation, feature capability checks, and new avoid items. |
 | 2.0 | 2026-02-08 | Expanded Bucket types section into comprehensive reference: all 28 bucket types with object key formats, sync directions, and priority classification. Added device bucket field access modes (device-only, special, cloud-writable) with complete field lists by category (~97 writable, ~113 read-only). Added shared bucket conditional write semantics and corrected field list (moved `fan_timer_timeout` and `fan_timer_duration` to device bucket). Added structure bucket complete field list. Added hvac_partner, topaz, and kryptonite field tables with subscribe filters. Added write protection, safety fields, and schedule sync guard documentation. Fixed Home/Away section direction errors (`auto_away_enable`, `auto_away_reset`, `home_away_input` are bidirectional, not device-only). |
 | 1.9 | 2026-02-08 | Added Temperature schedules section: schedule bucket format, complete JSON schema (version 2), day indexing (0=Monday), setpoint fields, temperature encoding (always Celsius), schedule modes, push/read flows, mode switching via shared bucket, continuation setpoints, custom schedules, debounce behavior (15-second sliding window), timestamp rejection, pending local change handling, auto-schedule learning caveat. Updated implementation checklist with schedule-related items. |
 | 1.8 | 2026-02-07 | Added "Batching multiple pushes" section under Server implementation notes. Explains how to send multiple chunks on a single subscribe connection using the device's 5-second closing timer reset behavior. |
