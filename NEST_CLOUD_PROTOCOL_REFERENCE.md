@@ -2,7 +2,7 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 1.7
+**Revision**: 1.8
 **Last updated**: 2026-02-07
 
 ---
@@ -30,6 +30,7 @@ Protocol specification for implementing a server that communicates with Nest the
 - [Server implementation notes](#server-implementation-notes)
   - [Session ID behavior](#session-id-behavior)
   - [Overlapping subscriptions](#overlapping-subscriptions)
+  - [Batching multiple pushes](#batching-multiple-pushes)
 - [Versioning and synchronization](#versioning-and-synchronization)
 - [Response headers](#response-headers)
   - [X-nl-suspend-time-max](#x-nl-suspend-time-max)
@@ -708,6 +709,70 @@ Device                              Server
   │<── Push data on B ────────────────│  Works correctly
 ```
 
+### Batching multiple pushes
+
+When your server has data to push on a subscribe connection, you can batch multiple pushes into a single connection instead of closing after each one. This avoids forcing the device through a full resubscribe cycle for every intermediate change — useful when a user makes rapid adjustments (e.g., clicking +/- repeatedly).
+
+**How it works**:
+
+1. Send the first chunk immediately when data is available.
+2. Hold the connection open briefly (recommend 3 seconds, must be under 5 seconds) waiting for additional data.
+3. If more data arrives within the batch window, send it as another chunk on the same connection.
+4. Repeat until no new data arrives within the window.
+5. Close the connection after the batch window expires with no new data.
+
+Each chunk must be a complete `{"objects": [...]}` JSON document. The device parses each chunk independently. Its 5-second closing timer resets on every chunk received, so the connection remains valid as long as you keep sending data within that window.
+
+**Tradeoff**: Single-item pushes now wait 3 seconds before closing, in case more data arrives. The device stays awake for those extra seconds. This is negligible for wall-powered devices and acceptable for battery-powered devices given the 600-second suspend cycle.
+
+#### Batched flow vs single-push flow
+
+```
+Single-push (without batching):
+
+User clicks +1°     +1°     +1°
+    |                 |       |
+Server               |       |
+    |── chunk 1 ─────>|       |
+    |── close ────────>|       |
+    |                 |       |
+    |   [device resubscribes] |
+    |                 |       |
+    |── chunk 2 ──────────────>|
+    |── close ─────────────────>|
+    |                 |       |
+    |   [device resubscribes] |
+    |                 |       |
+    |── chunk 3 ───────────────────>
+    |── close ──────────────────────>
+    = 3 subscribe cycles
+
+
+Batched (with 3s batch window):
+
+User clicks +1°     +1°     +1°
+    |                 |       |
+Server               |       |
+    |── chunk 1 ─────>|       |
+    |   [wait 3s...]  |       |
+    |── chunk 2 ──────────────>|
+    |   [wait 3s...]  |       |
+    |── chunk 3 ───────────────────>
+    |   [wait 3s, no more data]
+    |── close ──────────────────────>
+    = 1 subscribe cycle
+```
+
+#### Relevant timing constraints
+
+| Timer | Duration | Source |
+|-------|----------|--------|
+| Device closing window | 5 seconds | Resets on each chunk received |
+| Recommended batch window | 3 seconds | Server-side, must be < 5s |
+| Update pending | 3 seconds | Device-internal processing window |
+
+See the [Timing reference](#timing-reference) section for the full timing table.
+
 ---
 
 ## Versioning and synchronization
@@ -1320,6 +1385,7 @@ The user can also exit eco mode by physically turning the dial on the thermostat
 ### Recommended
 
 - [ ] Push updates immediately when available
+- [ ] Batch rapid pushes on a single subscribe connection (hold ≤3s between chunks)
 - [ ] Set `X-nl-defer-device-window: 15-30` for setpoint jitter
 - [ ] Set `X-nl-disable-defer-window: 60` when pushing temperature changes
 - [ ] Set `target_change_pending: true` when pushing temperature changes (wakes display)
@@ -1495,6 +1561,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 1.8 | 2026-02-07 | Added "Batching multiple pushes" section under Server implementation notes. Explains how to send multiple chunks on a single subscribe connection using the device's 5-second closing timer reset behavior. |
 | 1.7 | 2026-02-07 | Corrected Home/Away mode section — use `manual_eco_all` + `manual_eco_timestamp` instead of `away` field. The `away` field triggers auto-eco which is overridden by schedule preconditioning. Added timestamp requirement (600s staleness window). Added guidance on field conflicts and exiting eco mode. |
 | 1.6 | 2026-02-07 | Added Home/Away mode section: structure bucket controls away state, device bucket away fields are read-only, eco temperature behavior, structure key selection for claimed vs unclaimed devices. Enhanced structure bucket `away` field description. |
 | 1.5 | 2026-02-07 | Documented `X-nl-client-id` header format (`d.{SERIAL}.{random}`). Added entry key polling note (server must return same unexpired key). Fixed broken anchor links for defer-device-window. Fixed `if_object_revision` contradiction (now consistently "implementation-defined"). Fixed subscribe example to use `objects` array format. |
