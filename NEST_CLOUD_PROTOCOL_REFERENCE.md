@@ -2,8 +2,9 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 1.9
+**Revision**: 2.0
 **Last updated**: 2026-02-08
+**Author**: Chris Serio
 
 ---
 
@@ -41,7 +42,19 @@ Protocol specification for implementing a server that communicates with Nest the
   - [Concurrent PUT and subscribe](#concurrent-put-and-subscribe)
 - [Battery behavior](#battery-behavior)
 - [Bucket types](#bucket-types)
+  - [All bucket types](#all-bucket-types)
+  - [device bucket](#device-bucket)
+  - [shared bucket](#shared-bucket)
+  - [structure bucket](#structure-bucket)
+  - [user bucket](#user-bucket)
+  - [schedule bucket](#schedule-bucket)
+  - [device_alert_dialog bucket](#device_alert_dialog-bucket)
+  - [hvac_partner bucket](#hvac_partner-bucket)
+  - [topaz bucket](#topaz-bucket)
+  - [kryptonite bucket](#kryptonite-bucket)
   - [Display wake behavior](#display-wake-behavior)
+  - [Write protection](#write-protection)
+  - [Schedule sync guards](#schedule-sync-guards)
 - [Home/Away mode](#homeaway-mode)
   - [Set away mode](#set-away-mode)
   - [Set home mode](#set-home-mode)
@@ -49,7 +62,7 @@ Protocol specification for implementing a server that communicates with Nest the
   - [Why not the away field?](#why-not-the-away-field)
   - [Deliver the structure bucket](#deliver-the-structure-bucket)
   - [Choose the structure key](#choose-the-structure-key)
-  - [Device bucket away fields (read-only)](#device-bucket-away-fields-read-only)
+  - [Device bucket away fields](#device-bucket-away-fields)
   - [Eco temperatures](#eco-temperatures)
   - [Exiting eco mode](#exiting-eco-mode)
 - [Temperature schedules](#temperature-schedules)
@@ -1093,24 +1106,259 @@ When battery drops below 3.6V, the device goes completely offline. It reconnects
 
 ## Bucket types
 
-State is organized into named buckets. Each bucket has an `object_key` (e.g., `shared.09AB1234`), `object_revision`, and `object_timestamp`.
+State is organized into named data containers called buckets. Each bucket has an `object_key` (for example, `shared.09AB1234`), `object_revision`, and `object_timestamp`. For revision and timestamp semantics, see [Versioning and synchronization](#versioning-and-synchronization).
+
+Bucket object keys follow the format `{type}.{identifier}`. The type prefix determines how the device processes the data. The identifier is usually the device serial number but varies by bucket type.
+
+### All bucket types
+
+The device recognizes 28 bucket types. Most server implementations only need to handle the essential ones.
+
+| Bucket | Object key | Direction | Priority |
+|--------|-----------|-----------|----------|
+| `device` | `device.{serial}` | Bidirectional (restricted) | Essential |
+| `shared` | `shared.{serial}` | Bidirectional | Essential |
+| `structure` | `structure.{structureId}` | Server &rarr; device | Essential |
+| `user` | `user.{userId}` | Server &rarr; device | Essential |
+| `schedule` | `schedule.{serial}` | Bidirectional (guarded) | Essential |
+| `where` | `where.{whereId}` | Bidirectional | Secondary |
+| `message` | `message.{messageId}` | Bidirectional | Secondary |
+| `link` | `link.{linkId}` | Server &rarr; device | Secondary |
+| `custom_schedule` | `custom_schedule.{id}` | Bidirectional | Secondary |
+| `device_alert_dialog` | `device_alert_dialog.{id}` | Server &rarr; device | Secondary |
+| `hvac_partner` | `hvac_partner.{partnerId}` | Bidirectional | Specialized |
+| `topaz` | `topaz.{topazId}` | Server &rarr; device | Specialized |
+| `kryptonite` | `kryptonite.{sensorId}` | Bidirectional | Specialized |
+| `servicegroup` | `servicegroup.{id}` | Server &rarr; device | Specialized |
+| `occupancy` | `occupancy.{serial}` | Device &rarr; server | Specialized |
+| `demand_response` | `demand_response.{id}` | Bidirectional | Specialized |
+| `demand_response_event` | `demand_response_event.{eventId}` | Bidirectional | Specialized |
+| `utility` | `utility.{id}` | Server &rarr; device | Specialized |
+| `diamond_sensor_config` | `diamond_sensor_config.{id}` | Server &rarr; device | Specialized |
+| `diamond_sensor_event` | `diamond_sensor_event.{id}` | Bidirectional | Specialized |
+| `rate_plan` | `rate_plan.{id}` | Server &rarr; device | Specialized |
+| `tou` | `tou.{id}` | Bidirectional | Specialized |
+| `demand_charge` | `demand_charge.{id}` | Server &rarr; device | Specialized |
+| `demand_charge_event` | `demand_charge_event.{eventId}` | Bidirectional | Specialized |
+| `rcs_settings` | `rcs_settings.{id}` | Bidirectional | Specialized |
+| `cloud_algo` | `cloud_algo.{id}` | Bidirectional | Specialized |
+| `diagnostics` | `diagnostics.{id}` | Bidirectional | Specialized |
+| `tuneups` | `tuneups.{id}` | Bidirectional | Specialized |
+
+**Direction key:**
+
+| Direction | Meaning |
+|-----------|---------|
+| Server &rarr; device | Server pushes data on subscribe. Device reads and applies it. Device never sends this bucket in PUT requests. |
+| Device &rarr; server | Device sends data through PUT. Server stores it. |
+| Bidirectional | Both sides read and write. Some bidirectional buckets have per-field restrictions (see [device bucket](#device-bucket)). |
+
+### device bucket
+
+The largest bucket. Contains device telemetry, configuration, hardware state, and sensor readings. The device sends ~198 fields on a full sync after boot.
+
+**Object key**: `device.{serial}`
+**Direction**: Bidirectional (with per-field restrictions)
+**Revision type**: `base_object_revision` (unconditional)
+
+#### Field access modes
+
+Every field in the device bucket has one of three access modes that determine whether the server can write to it:
+
+| Mode | Count | Server can write? | In PUT? | Description |
+|------|-------|-------------------|---------|-------------|
+| Device-only | ~113 | **No** — device rejects and overwrites. See [Write protection](#write-protection). | Yes | Hardware state, sensors, computed values |
+| Special | ~29 | Varies | No | Custom processing paths (eco, HVAC capacities). Not in standard PUT. |
+| Cloud-writable | ~97 | **Yes** | Yes | Configuration the server can push. |
+
+#### Key read-only fields
+
+These fields appear in PUT requests. Store them, but don't try to overwrite them — the device ignores or actively reverts server writes to these fields.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `current_temperature` | float | Current measured temperature (Celsius) |
+| `current_humidity` | float | Current relative humidity (percent) |
+| `backplate_temperature` | float | Backplate temperature (Celsius) |
+| `battery_level` | float | Battery charge level |
+| `can_heat` | boolean | Heating capability detected |
+| `can_cool` | boolean | Cooling capability detected |
+| `has_fan` | boolean | Fan control available |
+| `has_humidifier` | boolean | Humidifier detected |
+| `has_dehumidifier` | boolean | Dehumidifier detected |
+| `hvac_ac_state` | boolean | Air conditioning running |
+| `hvac_heater_state` | boolean | Heater running |
+| `hvac_fan_state` | boolean | Fan running |
+| `hvac_aux_heater_state` | boolean | Auxiliary heater running |
+| `hvac_emer_heat_state` | boolean | Emergency heat running |
+| `leaf` | boolean | Leaf icon displayed (energy-saving indicator) |
+| `auto_away` | integer | Occupancy sensor state: `0` = home, `1` = away |
+| `time_to_target` | integer | Estimated seconds to reach target temperature |
+| `time_to_target_training` | string | Training status: `ready`, `training`, or `not_ready` |
+| `error_code` | string | Active error code |
+| `serial_number` | string | Device serial number |
+| `software_version` | string | Firmware version |
+| `model_version` | string | Hardware model |
+| `local_ip` | string | Device IP on local network |
+| `mac_address` | string | Wi-Fi MAC address |
+| `is_online` | boolean | Device considers itself connected |
+
+#### Cloud-writable fields
+
+These fields accept server writes through subscribe responses. Push them inside the `value` object of a `device.*` bucket.
+
+**Temperature settings:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `away_temperature_high` | float | Upper eco temperature (Celsius) |
+| `away_temperature_high_enabled` | boolean | Enable upper eco temperature limit |
+| `away_temperature_low` | float | Lower eco temperature (Celsius) |
+| `away_temperature_low_enabled` | boolean | Enable lower eco temperature limit |
+| `temperature_scale` | string | Display unit preference: `F` or `C` |
+| `upper_safety_temp` | float | Upper safety limit (Celsius) |
+| `upper_safety_temp_enabled` | boolean | Enable upper safety limit |
+| `lower_safety_temp` | float | Lower safety limit (Celsius) |
+| `lower_safety_temp_enabled` | boolean | Enable lower safety limit |
+
+**Temperature lock:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `temperature_lock` | boolean | Enable temperature lock |
+| `temperature_lock_high_temp` | float | Lock upper bound (Celsius) |
+| `temperature_lock_low_temp` | float | Lock lower bound (Celsius) |
+| `temperature_lock_pin_hash` | string | Lock PIN hash |
+
+**Fan settings:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `fan_mode` | string | Fan operating mode |
+| `fan_cooling_enabled` | boolean | Fan runs during cooling |
+| `fan_duty_cycle` | integer | Fan duty cycle (percent) |
+| `fan_duty_start_time` | integer | Fan schedule start (seconds from midnight) |
+| `fan_duty_end_time` | integer | Fan schedule end (seconds from midnight) |
+| `fan_heat_cool_speed` | string | Fan speed during HVAC operation |
+| `fan_schedule_speed` | string | Fan speed during scheduled runs |
+| `fan_timer_duration` | integer | Fan timer length (seconds) |
+| `fan_timer_speed` | string | Fan timer speed |
+| `fan_timer_timeout` | integer | Fan timer end time (Unix timestamp) |
+
+**Eco/away:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `auto_away_enable` | boolean | Enable occupancy-based auto-away |
+| `auto_away_reset` | boolean | Reset auto-away to home state |
+| `home_away_input` | boolean | Enable home/away feature |
+
+**Humidity control:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `auto_dehum_enabled` | boolean | Automatic dehumidification |
+| `target_humidity` | float | Target humidity (percent) |
+| `target_humidity_enabled` | boolean | Enable humidity targeting |
+| `humidifier_type` | string | Humidifier type |
+| `humidifier_fan_activation` | boolean | Fan activates with humidifier |
+| `dehumidifier_type` | string | Dehumidifier type |
+| `dehumidifier_fan_activation` | boolean | Fan activates with dehumidifier |
+| `dehumidifier_orientation_selected` | string | Dehumidifier orientation |
+| `humidity_control_lockout_enabled` | boolean | Enable humidity control lockout |
+| `humidity_control_lockout_start_time` | integer | Lockout start (seconds from midnight) |
+| `humidity_control_lockout_end_time` | integer | Lockout end (seconds from midnight) |
+
+**Heat pump / dual fuel:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `dual_fuel_breakpoint` | float | Temperature below which aux heat activates (Celsius) |
+| `dual_fuel_breakpoint_override` | string | Breakpoint override setting |
+| `dual_fuel_selected` | boolean | Dual fuel mode active |
+| `heat_pump_aux_threshold` | float | Aux heat lockout temperature (Celsius) |
+| `heat_pump_aux_threshold_enabled` | boolean | Enable aux heat threshold |
+| `heat_pump_comp_threshold` | float | Compressor lockout temperature (Celsius) |
+| `heat_pump_comp_threshold_enabled` | boolean | Enable compressor threshold |
+| `heatpump_savings` | string | Heat pump savings mode |
+
+**Learning and scheduling:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `learning_mode` | boolean | Auto-schedule learning enabled |
+| `schedule_learning_reset` | boolean | Reset learned schedule data |
+| `preconditioning_enabled` | boolean | Start heating/cooling before scheduled setpoints |
+| `max_nighttime_preconditioning_seconds` | integer | Max preconditioning duration at night |
+
+**Hot water (EU/UK Heat Link systems):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hot_water_away_enabled` | boolean | Hot water available during eco mode |
+| `hot_water_boost_time_to_end` | integer | Hot water boost timer end (Unix timestamp) |
+| `hot_water_mode` | string | Hot water operating mode |
+| `hot_water_temperature` | float | Hot water target temperature (Celsius) |
+| `heat_link_manual_mode` | boolean | Heat Link manual override |
+
+**Device configuration:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `click_sound` | boolean | Audible click on dial turn |
+| `farsight_screen` | string | Display content when approaching |
+| `should_wake_on_approach` | boolean | Wake display on approach |
+| `ob_orientation` | string | O/B wire orientation (heat pumps) |
+| `ob_persistence` | string | O/B wire persistence |
+| `radiant_control_enabled` | boolean | Radiant heating mode |
+| `sunlight_correction_enabled` | boolean | Compensate for direct sunlight on sensor |
+| `where_id` | string | Room assignment identifier |
+| `pro_id` | string | Nest Pro installer identifier |
+
+**Filter reminders:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `filter_changed_date` | integer | Last filter change (Unix timestamp) |
+| `filter_changed_set_date` | integer | Date the change was recorded |
+| `filter_reminder_enabled` | boolean | Enable filter change reminders |
+| `filter_replacement_threshold_sec` | integer | Filter lifetime (seconds) |
+
+**HVAC source/delivery** (wiring configuration):
+
+`alt_heat_delivery`, `alt_heat_source`, `alt_heat_x2_delivery`, `alt_heat_x2_source`, `aux_heat_delivery`, `aux_heat_source`, `cooling_delivery`, `cooling_source`, `cooling_x2_delivery`, `cooling_x2_source`, `cooling_x3_delivery`, `cooling_x3_source`, `emer_heat_delivery`, `emer_heat_enable`, `emer_heat_source`, `forced_air`, `heater_delivery`, `heater_source`, `heat_x2_delivery`, `heat_x2_source`, `heat_x3_delivery`, `heat_x3_source`, `star_type`, `y2_type`
+
+**Setup wizard state** (out-of-box):
+
+`oob_interview_completed`, `oob_temp_completed`, `oob_test_completed`, `oob_startup_completed`, `oob_summary_completed`, `oob_where_completed`, `oob_wifi_completed`, `oob_wires_completed`
 
 ### shared bucket
 
-Use this bucket to control temperature settings.
+Controls the active temperature setpoint and HVAC mode. This is the primary bucket for thermostat control.
 
-| Field | Type | Writable | Description |
-|-------|------|----------|-------------|
-| `target_temperature` | float | Yes | Target temperature (Celsius) |
-| `target_temperature_high` | float | Yes | Upper bound for range mode (Celsius) |
-| `target_temperature_low` | float | Yes | Lower bound for range mode (Celsius) |
-| `target_temperature_type` | string | Yes | `heat`, `cool`, `range`, or `off` |
-| `target_change_pending` | boolean | Yes | Signals a pending temperature change. See [Display wake behavior](#display-wake-behavior). |
-| `schedule_mode` | string | Yes | Active schedule mode: `HEAT`, `COOL`, or `RANGE`. See [Temperature schedules](#temperature-schedules). |
-| `fan_timer_timeout` | integer | Yes | Fan timer end time (Unix timestamp) |
-| `fan_timer_duration` | integer | Yes | Fan timer duration (seconds) |
+**Object key**: `shared.{serial}`
+**Direction**: Bidirectional
+**Revision type**: `if_object_revision` (conditional write)
 
-**Writable** fields can be pushed via subscribe. The device also sends these fields in PUT requests when changed locally.
+> **Important**: The `shared` bucket is the **only** bucket that uses conditional writes. When the device sends a PUT with `if_object_revision`, it expects the server to reject the write if the revision doesn't match. This prevents the device from overwriting a temperature change that the server pushed while the device was preparing its PUT. All other buckets use `base_object_revision` (unconditional). See [Versioning and synchronization](#versioning-and-synchronization).
+
+#### Fields
+
+| Field | Type | Server | Description |
+|-------|------|--------|-------------|
+| `target_temperature` | float | Read/write | Target temperature in Celsius |
+| `target_temperature_high` | float | Read/write | Upper bound in range mode (Celsius) |
+| `target_temperature_low` | float | Read/write | Lower bound in range mode (Celsius) |
+| `target_temperature_type` | string | Read/write | HVAC mode: `heat`, `cool`, `range`, or `off` |
+| `target_change_pending` | boolean | Read/write | Pending temperature change flag. See [Display wake behavior](#display-wake-behavior). |
+| `schedule_mode` | string | Read/write | Active schedule mode: `HEAT`, `COOL`, or `RANGE`. See [Temperature schedules](#temperature-schedules). |
+| `can_heat` | boolean | Read | Device supports heating |
+| `can_cool` | boolean | Read | Device supports cooling |
+| `name` | string | Read/write | Device display name |
+
+#### Temperature precision
+
+Temperature values are stored internally as fixed-point numbers. Changes smaller than ~0.01 C are treated as insignificant and ignored.
 
 #### Display wake behavior
 
@@ -1129,7 +1377,7 @@ When you push a temperature change to a sleeping device, the device wakes and ap
 - Fan settings
 - Any field in the `device` or `structure` buckets
 
-#### How it works
+#### How display wake works
 
 1. Your server pushes `target_temperature` and `target_change_pending: true` together.
 2. The device wakes, applies the temperature, and lights the display.
@@ -1172,57 +1420,89 @@ Server                              Device
   |   [Server accepts false]          |  Don't push true again
 ```
 
-### device bucket
+### structure bucket
 
-Use this bucket for device configuration and to read current sensor values.
+Home-level settings that apply to all devices in a structure. The device never sends this bucket in PUT requests.
 
-| Field | Type | Writable | Description |
-|-------|------|----------|-------------|
-| `current_temperature` | float | No | Current measured temperature (Celsius) |
-| `current_humidity` | float | No | Current measured humidity (percent) |
-| `away_temperature_high` | float | Yes | Upper eco/away temperature (Celsius) |
-| `away_temperature_low` | float | Yes | Lower eco/away temperature (Celsius) |
-| `temperature_scale` | string | Yes | Display units: `F` or `C` |
-| `can_heat` | boolean | No | Heating capability |
-| `can_cool` | boolean | No | Cooling capability |
-| `has_fan` | boolean | No | Fan control capability |
-| `hvac_ac_state` | boolean | No | AC running |
-| `hvac_heater_state` | boolean | No | Heater running |
-| `hvac_fan_state` | boolean | No | Fan running |
+**Object key**: `structure.{structureId}`
+**Direction**: Server &rarr; device only
+
+For eco mode control and structure key selection, see [Home/Away mode](#homeaway-mode).
+
+#### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `away` | boolean | Legacy away flag. **Don't use for eco control** — overridden by schedule preconditioning. See [Home/Away mode](#homeaway-mode). |
+| `manual_eco_all` | boolean | Eco mode control. `true` activates eco mode. |
+| `manual_eco_timestamp` | integer | Unix timestamp (seconds) of the eco change. **Must be within 600 seconds of device clock.** |
+| `house_type` | string | House type classification |
+| `renovation_date` | string | Year of last renovation |
+| `num_thermostats` | string | Number of thermostats in the structure |
+| `country_code` | string | ISO country code |
+| `postal_code` | string | Postal/ZIP code |
+| `location` | object | Location data (zipcode, country, latitude, longitude) |
+| `time_zone` | object | Timezone information |
+| `devices` | string | Comma-separated device object keys (for example, `device.09AA01AC12345678`) |
+| `name` | string | Structure name |
+| `dr_reminder_enabled` | boolean | Demand response reminders enabled |
 
 ### user bucket
 
-Use this bucket to complete pairing. See [Pairing](#pairing) for details.
+Exists solely to trigger pairing completion on the device. The device ignores all fields except `name`. See [Pairing](#pairing) for the complete flow.
 
-| Field | Type | Writable | Description |
-|-------|------|----------|-------------|
-| `name` | string | Yes | User identifier. Triggers pairing completion on the device. |
+**Object key**: `user.{userId}`
+**Direction**: Server &rarr; device only
 
-### structure bucket
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | User identifier. Triggers pairing completion on the device. |
 
-Use this bucket for home-level settings and device-structure association.
+### schedule bucket
 
-| Field | Type | Writable | Description |
-|-------|------|----------|-------------|
-| `manual_eco_all` | boolean | Yes | Eco mode. Set to `true` to activate eco mode. See [Home/Away mode](#homeaway-mode). |
-| `manual_eco_timestamp` | integer | Yes | Unix timestamp (seconds) for eco mode change. Must be within 600s of device clock. |
-| `away` | boolean | Yes | Legacy away field. Do **not** use for eco control — overridden by schedule preconditioning. |
-| `name` | string | Yes | Structure name |
-| `devices` | array | Yes | List of device serials belonging to this structure |
-| `postal_code` | string | Yes | Postal/ZIP code |
-| `time_zone` | string | Yes | Timezone identifier |
+Temperature schedules. See [Temperature schedules](#temperature-schedules) for the complete JSON format, day indexing, setpoint fields, and sync behavior.
 
-### Other buckets
+**Object key**: `schedule.{serial}`
+**Direction**: Bidirectional, subject to [sync guards](#schedule-sync-guards)
+**Revision type**: `base_object_revision` (unconditional)
 
-| Bucket | Purpose |
-|--------|---------|
-| `schedule` | Heating/cooling schedules. See [Temperature schedules](#temperature-schedules). |
-| `where` | Room/location assignments |
-| `message` | In-app messages |
+### where bucket
+
+Room and location labels for devices. The `where_id` field in the device bucket references a `where` bucket entry.
+
+**Object key**: `where.{whereId}`
+**Direction**: Bidirectional
+**Revision type**: `base_object_revision`
+
+### message bucket
+
+Cloud-to-device messages, including reboot commands and notifications.
+
+**Object key**: `message.{messageId}`
+**Direction**: Bidirectional
+**Revision type**: `base_object_revision`
+
+### link bucket
+
+Associates a device with a structure. The device receives this on subscribe but doesn't PUT it.
+
+**Object key**: `link.{linkId}`
+**Direction**: Server &rarr; device only
+
+### custom_schedule bucket
+
+User-created custom temperature schedules. Same JSON format as the [schedule bucket](#schedule-bucket). The identifier is **server-assigned** — the device never creates schedule IDs on its own. See [Custom schedules](#custom-schedules).
+
+**Object key**: `custom_schedule.{id}`
+**Direction**: Bidirectional
+**Revision type**: `base_object_revision`
 
 ### device_alert_dialog bucket
 
-Use this bucket for server-initiated dialog prompts displayed on the device.
+Server-initiated dialog prompts displayed on the device screen.
+
+**Object key**: `device_alert_dialog.{id}`
+**Direction**: Server &rarr; device only
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1235,6 +1515,114 @@ Use this bucket for server-initiated dialog prompts displayed on the device.
 | `timeout` | integer | Dialog timeout in seconds |
 
 To display a dialog, push a `dialog_id` value. To dismiss the dialog, clear or empty `dialog_id`.
+
+### hvac_partner bucket
+
+Data from Heat Link boilers, primarily EU/UK systems.
+
+**Object key**: `hvac_partner.{partnerId}`
+**Direction**: Bidirectional
+**Revision type**: `base_object_revision`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `boiler_setpoint` | float | Boiler target temperature (Celsius, range: -40 to 127) |
+| `modulation` | float | Boiler modulation level |
+| `gas_usage` | float | Gas usage metric |
+| `water_temp` | float | Water temperature (Celsius) |
+| `fault_code` | string | Active fault code |
+| `flame_on` | boolean | Burner flame status |
+
+### topaz bucket
+
+Status data from Nest Protect (smoke and CO detector) devices. The thermostat uses Protect occupancy sensors for auto-away decisions.
+
+**Object key**: `topaz.{topazId}`
+**Direction**: Server &rarr; device only
+
+The device subscribes to only 7 fields from this bucket. Other fields in the push are silently ignored.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `co_status` | integer | Carbon monoxide alarm status |
+| `smoke_status` | integer | Smoke alarm status |
+| `line_power_present` | boolean | Mains power connected |
+| `hushed_state` | boolean | Alarm silenced |
+| `spoken_where_id` | string | Room assignment for voice announcements |
+| `thread_mac_address` | string | Thread radio MAC address |
+| `home_away_input` | boolean | Occupancy sensor home/away state |
+
+### kryptonite bucket
+
+Data from Nest Temperature Sensors (remote wireless sensors).
+
+**Object key**: `kryptonite.{sensorId}`
+**Direction**: Bidirectional
+
+The device subscribes to only 2 fields from this bucket:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `where_id` | string | Room assignment |
+| `description` | string | Sensor description |
+
+### Remaining bucket types
+
+These buckets support energy utility programs, peripheral devices, and diagnostics. They follow the standard sync protocol but are rarely relevant for home server implementations. Store any data the device sends for these buckets, and serve it back on subscribe.
+
+| Bucket | Description |
+|--------|-------------|
+| `servicegroup` | Service group configuration (server &rarr; device) |
+| `occupancy` | Per-device occupancy data (device &rarr; server, rarely used) |
+| `tuneups` | Seasonal Savings energy optimization events |
+| `demand_response` | Demand response program enrollment |
+| `demand_response_event` | Individual demand response event instances |
+| `utility` | Utility provider information (server &rarr; device) |
+| `diamond_sensor_config` | Temperature sensor configuration (server &rarr; device) |
+| `diamond_sensor_event` | Temperature sensor event data |
+| `rate_plan` | Utility rate plan information (server &rarr; device) |
+| `tou` | Time-of-use electricity pricing |
+| `demand_charge` | Demand charge configuration (server &rarr; device) |
+| `demand_charge_event` | Demand charge event instances |
+| `rcs_settings` | Remote comfort sensor settings |
+| `cloud_algo` | Cloud algorithm parameters |
+| `diagnostics` | Device diagnostics data |
+
+### Temperature values
+
+All temperature values across all buckets use **Celsius**. The `temperature_scale` field in the device bucket (`F` or `C`) is a display-only preference — it doesn't affect the data format.
+
+The device serializes temperatures with up to 5 decimal places (for example, `21.00000`). Changes smaller than approximately 0.01 C are ignored.
+
+### Write protection
+
+The device protects ~113 device-only fields from server writes. If you push a value for one of these fields, the device compares it against its local value. If different, it marks the field dirty and re-sends its own value in the next PUT — actively overwriting your change. Accept these re-PUTs normally.
+
+Twelve device-only fields have explicit consistency checking and logging:
+
+`heat_link_connection`, `error_code`, `wiring_error`, `auto_dehum_state`, `away_temperature_low_adjusted`, `away_temperature_high_adjusted`, `dehumidifier_state`, `demand_charge_icon`, `fan_control_state`, `fan_cooling_state`, `humidifier_state`, `tou_icon`
+
+Don't write to device-only fields. The device always wins.
+
+### Safety fields
+
+When any safety-related field changes, the device forces four additional fields into the PUT regardless of whether they changed: `battery_level`, `safety_temp_activating_hvac`, `safety_state`, and `safety_state_time`. Accept these extra fields in your normal merge process.
+
+### Schedule sync guards
+
+Three mechanisms protect schedule integrity. For details and examples, see [Schedule behavior details](#schedule-behavior-details).
+
+1. **15-second debounce**: Multiple schedule pushes within 15 seconds — only the last one takes effect.
+2. **Pending local change**: If the user is editing the schedule on the device, incoming server pushes are discarded.
+3. **Timestamp rejection**: Schedules with older timestamps than the current schedule are silently rejected.
+
+### PUT order
+
+When the device sends a PUT with multiple buckets, they appear in this order:
+
+`demand_response` &rarr; `demand_response_event` &rarr; `tuneups` &rarr; `structure` &rarr; `schedule` &rarr; `custom_schedule` &rarr; `message` &rarr; `shared` &rarr; `device` &rarr; `where` &rarr; `diamond_sensor_event` &rarr; `tou` &rarr; `hvac_partner` &rarr; `cloud_algo` &rarr; `demand_charge_event` &rarr; `rcs_settings` &rarr; `kryptonite` &rarr; `diagnostics`
+
+The server doesn't need to process them in order. This is documented for debugging.
 
 ---
 
@@ -1315,20 +1703,20 @@ For the initial delivery (before the device knows about the structure), include 
 
 For unclaimed devices, use `structure.default` as the structure key. The device processes it the same way regardless of the key name — what matters is that the bucket type is `structure`.
 
-### Device bucket away fields (read-only)
+### Device bucket away fields
 
-The device bucket contains several away-related fields. These reflect the device's **own sensors and state** — writing to them from the server has no effect on eco mode.
+The device bucket contains several away-related fields. The `auto_away` field is device-only (read-only from the server). The others are cloud-writable but **don't control eco mode** — use the structure bucket's `manual_eco_all` field instead.
 
 | Field | Type | Direction | Description |
 |-------|------|-----------|-------------|
-| `auto_away` | boolean | Device → Server | Occupancy sensor output. `true` when no presence detected. |
-| `auto_away_enable` | boolean | Device → Server | Whether the occupancy sensor is active. |
-| `auto_away_reset` | boolean | Device → Server | Reset flag for auto-away state. |
-| `home_away_input` | boolean | Device → Server | Physical presence detection input. |
-| `away_temperature_high` | float | Bidirectional | Upper eco temperature (Celsius). Device-writable. |
-| `away_temperature_low` | float | Bidirectional | Lower eco temperature (Celsius). Device-writable. |
+| `auto_away` | integer | Device &rarr; server | Occupancy sensor output. `0` = home, `1` = away. |
+| `auto_away_enable` | boolean | Bidirectional | Whether the occupancy sensor is active. |
+| `auto_away_reset` | boolean | Bidirectional | Reset auto-away to home state. |
+| `home_away_input` | boolean | Bidirectional | Enable home/away feature globally. |
+| `away_temperature_high` | float | Bidirectional | Upper eco temperature (Celsius). |
+| `away_temperature_low` | float | Bidirectional | Lower eco temperature (Celsius). |
 
-> **Warning**: Don't write `auto_away` or `away` to the device bucket expecting to control eco mode. The device ignores server-pushed values for these fields in the device bucket. Use the structure bucket's `manual_eco_all` field instead.
+> **Warning**: Don't write `auto_away` to the device bucket expecting to control eco mode — it's a read-only sensor output. For the complete list of device bucket fields and their access modes, see [device bucket](#device-bucket).
 
 ### Eco temperatures
 
@@ -1875,7 +2263,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 | Entry endpoint | Complete |
 | Authentication | Provisional |
 | Pairing | Complete |
-| Bucket schemas | Complete |
+| Bucket types | Complete |
 | Home/Away mode | Complete |
 | Temperature schedules | Complete |
 | Error handling | Partial |
@@ -1886,6 +2274,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.0 | 2026-02-08 | Expanded Bucket types section into comprehensive reference: all 28 bucket types with object key formats, sync directions, and priority classification. Added device bucket field access modes (device-only, special, cloud-writable) with complete field lists by category (~97 writable, ~113 read-only). Added shared bucket conditional write semantics and corrected field list (moved `fan_timer_timeout` and `fan_timer_duration` to device bucket). Added structure bucket complete field list. Added hvac_partner, topaz, and kryptonite field tables with subscribe filters. Added write protection, safety fields, and schedule sync guard documentation. Fixed Home/Away section direction errors (`auto_away_enable`, `auto_away_reset`, `home_away_input` are bidirectional, not device-only). |
 | 1.9 | 2026-02-08 | Added Temperature schedules section: schedule bucket format, complete JSON schema (version 2), day indexing (0=Monday), setpoint fields, temperature encoding (always Celsius), schedule modes, push/read flows, mode switching via shared bucket, continuation setpoints, custom schedules, debounce behavior (15-second sliding window), timestamp rejection, pending local change handling, auto-schedule learning caveat. Updated implementation checklist with schedule-related items. |
 | 1.8 | 2026-02-07 | Added "Batching multiple pushes" section under Server implementation notes. Explains how to send multiple chunks on a single subscribe connection using the device's 5-second closing timer reset behavior. |
 | 1.7 | 2026-02-07 | Corrected Home/Away mode section — use `manual_eco_all` + `manual_eco_timestamp` instead of `away` field. The `away` field triggers auto-eco which is overridden by schedule preconditioning. Added timestamp requirement (600s staleness window). Added guidance on field conflicts and exiting eco mode. |
