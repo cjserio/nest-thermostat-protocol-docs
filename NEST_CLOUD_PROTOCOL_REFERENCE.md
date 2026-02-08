@@ -2,8 +2,8 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 1.8
-**Last updated**: 2026-02-07
+**Revision**: 1.9
+**Last updated**: 2026-02-08
 
 ---
 
@@ -52,6 +52,19 @@ Protocol specification for implementing a server that communicates with Nest the
   - [Device bucket away fields (read-only)](#device-bucket-away-fields-read-only)
   - [Eco temperatures](#eco-temperatures)
   - [Exiting eco mode](#exiting-eco-mode)
+- [Temperature schedules](#temperature-schedules)
+  - [Schedule bucket](#schedule-bucket)
+  - [Schedule JSON format](#schedule-json-format)
+  - [Day indexing](#day-indexing)
+  - [Setpoint fields](#setpoint-fields)
+  - [Temperature encoding](#temperature-encoding)
+  - [Schedule modes](#schedule-modes)
+  - [Push a schedule to the device](#push-a-schedule-to-the-device)
+  - [Read schedules from the device](#read-schedules-from-the-device)
+  - [Switch schedule mode](#switch-schedule-mode)
+  - [Continuation setpoints](#continuation-setpoints)
+  - [Custom schedules](#custom-schedules)
+  - [Schedule behavior details](#schedule-behavior-details)
 - [Error handling](#error-handling)
 - [Implementation checklist](#implementation-checklist)
 - [Examples](#examples)
@@ -1093,6 +1106,7 @@ Use this bucket to control temperature settings.
 | `target_temperature_low` | float | Yes | Lower bound for range mode (Celsius) |
 | `target_temperature_type` | string | Yes | `heat`, `cool`, `range`, or `off` |
 | `target_change_pending` | boolean | Yes | Signals a pending temperature change. See [Display wake behavior](#display-wake-behavior). |
+| `schedule_mode` | string | Yes | Active schedule mode: `HEAT`, `COOL`, or `RANGE`. See [Temperature schedules](#temperature-schedules). |
 | `fan_timer_timeout` | integer | Yes | Fan timer end time (Unix timestamp) |
 | `fan_timer_duration` | integer | Yes | Fan timer duration (seconds) |
 
@@ -1202,7 +1216,7 @@ Use this bucket for home-level settings and device-structure association.
 
 | Bucket | Purpose |
 |--------|---------|
-| `schedule` | Heating/cooling schedules |
+| `schedule` | Heating/cooling schedules. See [Temperature schedules](#temperature-schedules). |
 | `where` | Room/location assignments |
 | `message` | In-app messages |
 
@@ -1328,6 +1342,306 @@ The user can also exit eco mode by physically turning the dial on the thermostat
 
 ---
 
+## Temperature schedules
+
+The device maintains a weekly temperature schedule that determines its target temperature throughout the day. Your server can push complete schedules to the device and receive schedule updates when the user modifies the schedule locally (for example, by turning the dial).
+
+### Schedule bucket
+
+The schedule bucket uses the key `schedule.<serial>`, where `<serial>` is the device's serial number. The device subscribes to this bucket automatically.
+
+| Property | Value |
+|----------|-------|
+| Bucket key | `schedule.<serial>` |
+| Direction | Bidirectional |
+| Subscribe | Device subscribes to this bucket |
+| PUT | Device sends schedule changes via PUT |
+
+> **Note**: Unlike the structure bucket, the device explicitly subscribes to the schedule bucket. You don't need to inject it — it appears in the device's subscribe request body alongside `device` and `shared`.
+
+### Schedule JSON format
+
+The schedule value is a single JSON object containing the full weekly schedule. Version is always `2`.
+
+```json
+{
+  "ver": 2,
+  "name": "Default",
+  "schedule_mode": "HEAT",
+  "days": {
+    "0": {
+      "0": {
+        "type": "HEAT",
+        "time": 25200,
+        "entry_type": "setpoint",
+        "temp": 21.00000
+      },
+      "1": {
+        "type": "HEAT",
+        "time": 32400,
+        "entry_type": "setpoint",
+        "temp": 18.50000
+      }
+    },
+    "1": {},
+    "2": {},
+    "3": {},
+    "4": {},
+    "5": {},
+    "6": {}
+  }
+}
+```
+
+#### Top-level fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ver` | integer | Yes | Schema version. Always `2`. |
+| `name` | string | Yes | Schedule name (for example, `"Default"`). |
+| `schedule_mode` | string | Yes | Active mode. One of: `HEAT`, `COOL`, `RANGE`. See [Schedule modes](#schedule-modes). |
+| `days` | object | Yes | Container for daily setpoints, keyed `"0"` through `"6"`. |
+
+> **Note**: The device parser accepts both `schedule_mode` and `mode` as the key name. Use `schedule_mode` for consistency.
+
+### Day indexing
+
+Days are indexed as integer strings starting from Monday:
+
+| Key | Day |
+|-----|-----|
+| `"0"` | Monday |
+| `"1"` | Tuesday |
+| `"2"` | Wednesday |
+| `"3"` | Thursday |
+| `"4"` | Friday |
+| `"5"` | Saturday |
+| `"6"` | Sunday |
+
+Within each day, setpoints are also keyed by sequential integer strings: `"0"`, `"1"`, `"2"`, and so on.
+
+> **Warning**: The day-of-week mapping starts with Monday, not Sunday. This differs from many programming language conventions. Double-check your day mapping when generating schedules.
+
+### Setpoint fields
+
+Each setpoint object within a day has the following fields:
+
+| Field | Type | Modes | Description |
+|-------|------|-------|-------------|
+| `type` | string | All | Setpoint type: `HEAT`, `COOL`, or `RANGE`. |
+| `time` | integer | All | Seconds from midnight (0–86399). |
+| `entry_type` | string | All | `"setpoint"` for user-defined points, `"continuation"` for implied fill. See [Continuation setpoints](#continuation-setpoints). |
+| `temp` | float | HEAT, COOL | Target temperature in Celsius. |
+| `temp-min` | float | RANGE | Lower bound temperature in Celsius. |
+| `temp-max` | float | RANGE | Upper bound temperature in Celsius. |
+
+The `type` field in each setpoint must match the schedule's `schedule_mode`. A `HEAT` schedule contains only `HEAT` setpoints, and a `RANGE` schedule contains only `RANGE` setpoints.
+
+#### HEAT or COOL setpoint example
+
+```json
+{
+  "type": "HEAT",
+  "time": 25200,
+  "entry_type": "setpoint",
+  "temp": 21.00000
+}
+```
+
+The `time` value `25200` represents 7:00 AM (7 hours * 3600 seconds/hour).
+
+#### RANGE setpoint example
+
+```json
+{
+  "type": "RANGE",
+  "time": 25200,
+  "entry_type": "setpoint",
+  "temp-min": 18.00000,
+  "temp-max": 24.00000
+}
+```
+
+In RANGE mode, use `temp-min` and `temp-max` instead of `temp`. The device heats if the temperature drops below `temp-min` and cools if it rises above `temp-max`.
+
+### Temperature encoding
+
+Temperatures in the schedule are always Celsius, regardless of the device's display preference (`temperature_scale` in the device bucket). The device converts to Fahrenheit internally for display only.
+
+| Property | Value |
+|----------|-------|
+| Unit | Celsius (always) |
+| Format | Floating-point with up to 5 decimal places |
+| Precision | ~0.25°C minimum meaningful increment |
+
+Write temperature values as floating-point numbers. The device stores them as fixed-point integers internally, so sub-0.25°C precision is lost.
+
+### Schedule modes
+
+The device supports several schedule modes, though only three are common for residential thermostats:
+
+| Mode | Description | Setpoint fields |
+|------|-------------|----------------|
+| `HEAT` | Heating only | `temp` |
+| `COOL` | Cooling only | `temp` |
+| `RANGE` | Dual heat and cool | `temp-min`, `temp-max` |
+
+The device also recognizes `EMERGENCY`, `HUMIDIFY`, `DEHUMIDIFY`, and `HOTWATER`, but these are uncommon and hardware-dependent. If you push a mode the device's hardware can't support (for example, `COOL` on a heat-only system), the device falls back to a supported mode.
+
+The active schedule mode is stored in the shared bucket as `schedule_mode`. See [Switch schedule mode](#switch-schedule-mode).
+
+### Push a schedule to the device
+
+To push a schedule, include the schedule bucket in a subscribe response. The value is the complete schedule JSON object:
+
+```json
+{
+  "objects": [
+    {
+      "object_revision": 100,
+      "object_timestamp": 1707148800000,
+      "object_key": "schedule.09AA01AB12345678",
+      "value": {
+        "ver": 2,
+        "name": "My Schedule",
+        "schedule_mode": "HEAT",
+        "days": {
+          "0": {
+            "0": {"type": "HEAT", "time": 21600, "entry_type": "setpoint", "temp": 20.00000},
+            "1": {"type": "HEAT", "time": 28800, "entry_type": "setpoint", "temp": 21.50000},
+            "2": {"type": "HEAT", "time": 64800, "entry_type": "setpoint", "temp": 19.00000}
+          },
+          "1": {
+            "0": {"type": "HEAT", "time": 21600, "entry_type": "setpoint", "temp": 20.00000},
+            "1": {"type": "HEAT", "time": 28800, "entry_type": "setpoint", "temp": 21.50000},
+            "2": {"type": "HEAT", "time": 64800, "entry_type": "setpoint", "temp": 19.00000}
+          },
+          "2": {},
+          "3": {},
+          "4": {},
+          "5": {},
+          "6": {}
+        }
+      }
+    }
+  ]
+}
+```
+
+> **Important**: Always push the **complete** schedule, not individual setpoints. The device replaces the entire schedule on each push. There is no mechanism to add or remove individual setpoints.
+
+> **Note**: Remember that `object_revision` and `object_timestamp` must appear before `object_key` in the JSON. See [Response format](#response-body).
+
+### Read schedules from the device
+
+The device sends schedule updates to your server through PUT requests. The schedule data appears under the `schedule.<serial>` key:
+
+```http
+POST /abc123/put HTTP/1.1
+Content-Type: application/json
+
+{
+  "session": "sess_xyz789",
+  "schedule.09AA01AB12345678": {
+    "object_key": "schedule.09AA01AB12345678",
+    "base_object_revision": 99,
+    "ver": 2,
+    "name": "Default",
+    "schedule_mode": "HEAT",
+    "days": {
+      "0": {
+        "0": {"type": "HEAT", "time": 25200, "entry_type": "setpoint", "temp": 21.00000}
+      }
+    }
+  }
+}
+```
+
+Store the schedule value in its entirety. When the device subscribes, compare revisions and timestamps as you would for any other bucket, and return the schedule if the server's version is newer.
+
+### Switch schedule mode
+
+The active schedule mode is controlled by the `schedule_mode` field in the **shared** bucket, not the schedule bucket. To switch between heating and cooling schedules, push a shared bucket update:
+
+```json
+{
+  "objects": [
+    {
+      "object_revision": 459,
+      "object_timestamp": 1707148800000,
+      "object_key": "shared.09AA01AB12345678",
+      "value": {
+        "schedule_mode": "COOL"
+      }
+    }
+  ]
+}
+```
+
+The device validates the mode against its hardware capabilities:
+
+| Mode | Requires |
+|------|----------|
+| `HEAT` | Heat capability (`can_heat: true` in device bucket) |
+| `COOL` | Cool capability (`can_cool: true` in device bucket) |
+| `RANGE` | Both heat and cool capability |
+
+If the device can't support the requested mode, it falls back to a mode its hardware supports.
+
+> **Note**: The `schedule_mode` field appears in two places: inside the schedule JSON (determines which setpoint types the schedule contains) and in the shared bucket (determines which schedule mode is active). Keep them in sync — if the shared bucket says `COOL` but you push a schedule with `schedule_mode: "HEAT"`, the device ignores the schedule.
+
+### Continuation setpoints
+
+Setpoints with `entry_type: "continuation"` are filler entries that carry forward the previous setpoint's temperature. The device generates these automatically when processing a schedule.
+
+When pushing a schedule, you only need to include `"setpoint"` entries. The device fills in continuation entries for any gaps. If you include continuation entries in your push, the device accepts them, but it overwrites them during processing anyway.
+
+When reading schedules from the device (via PUT), the device may include continuation entries. Store them as-is, but understand that only `"setpoint"` entries represent user-configured temperatures.
+
+### Custom schedules
+
+The device supports additional schedules beyond the default built-in schedule. Custom schedules use a separate bucket key format:
+
+```
+custom_schedule.<schedule_id>
+```
+
+The `<schedule_id>` is **server-generated**. The device never creates schedule IDs on its own — it expects the server to assign them. The JSON format inside a custom schedule bucket is identical to the standard schedule format.
+
+Custom schedules appear in the device bucket as a comma-separated list of bucket keys. If your server doesn't need multiple schedules, you can ignore custom schedules entirely and work only with the default `schedule.<serial>` bucket.
+
+### Schedule behavior details
+
+#### 15-second debounce
+
+The device debounces incoming schedule pushes with a 15-second sliding window. If you push multiple schedule updates in rapid succession, only the last one takes effect — after 15 seconds of quiet.
+
+Push the schedule once and don't retry within the debounce window. There is no acknowledgment — the device applies the schedule silently.
+
+> **Note**: During connection recovery (for example, after the device reconnects), the debounce is bypassed entirely. Schedules pushed during recovery take effect immediately.
+
+#### Timestamp rejection
+
+If the device's current schedule has a newer timestamp than the one you push, the device silently rejects the push. Always use a current `object_timestamp` when pushing schedules. Don't reuse old timestamps from previous responses.
+
+#### Pending local changes
+
+If the user has modified the schedule locally (for example, by adjusting the schedule through the device's dial or a connected app) and the change hasn't been sent to the server yet, the device discards incoming cloud schedules entirely. The device's local version takes priority.
+
+This means a schedule push can silently fail if the user is actively editing the schedule. There is no error response — the device simply ignores the push and uploads its local version in the next PUT.
+
+#### Maximum setpoints
+
+Each day supports a maximum of 96 setpoints. In practice, schedules rarely have more than 10–12 setpoints per day.
+
+#### Auto-schedule learning
+
+The device has a built-in learning system that automatically modifies the schedule based on user behavior (dial turns, temperature holds). Cloud-pushed schedule changes are treated as user actions by the learning system, so the device may subsequently adjust the schedule you pushed.
+
+If you need the schedule to remain exactly as pushed, the user must disable the auto-schedule feature through the device settings. There is no server-side mechanism to disable learning.
+
+---
+
 ## Error handling
 
 ### HTTP status codes
@@ -1381,6 +1695,10 @@ The user can also exit eco mode by physically turning the dial on the thermostat
 - [ ] Push structure bucket to establish device-home association
 - [ ] Include `manual_eco_timestamp` as Unix seconds (not milliseconds) when pushing eco mode changes
 - [ ] Include user and structure buckets on every subscribe for paired devices
+- [ ] Store schedule data from device PUTs and return it on subscribe when newer
+- [ ] Push complete schedules (all days, all setpoints), not partial updates
+- [ ] Use Celsius for all schedule temperatures (device converts for display)
+- [ ] Use day indexing 0=Monday through 6=Sunday in schedule JSON
 
 ### Recommended
 
@@ -1394,6 +1712,8 @@ The user can also exit eco mode by physically turning the dial on the thermostat
 - [ ] Log device connections for debugging
 - [ ] Use `base_object_revision` from PUT requests for conflict detection
 - [ ] Accept PUTs at any time, even while subscribe connections are open
+- [ ] Wait at least 15 seconds after pushing a schedule before pushing another (debounce)
+- [ ] Serve schedule bucket on subscribe when device requests it
 
 ### Avoid
 
@@ -1407,6 +1727,10 @@ The user can also exit eco mode by physically turning the dial on the thermostat
 - [ ] Sending entry key `expires` as a JSON string (must be a number)
 - [ ] Provisioning credentials through 401 responses (can cause credential loop)
 - [ ] Using the structure bucket `away` field for eco mode control (overridden by schedule preconditioning)
+- [ ] Pushing partial schedules (individual setpoints) — always push the complete schedule
+- [ ] Using Fahrenheit in schedule temperature values — always use Celsius
+- [ ] Pushing schedules rapidly without waiting for the 15-second debounce window
+- [ ] Assuming Sunday=0 for schedule days — 0 is Monday
 
 ---
 
@@ -1553,6 +1877,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 | Pairing | Complete |
 | Bucket schemas | Complete |
 | Home/Away mode | Complete |
+| Temperature schedules | Complete |
 | Error handling | Partial |
 
 ---
@@ -1561,6 +1886,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 1.9 | 2026-02-08 | Added Temperature schedules section: schedule bucket format, complete JSON schema (version 2), day indexing (0=Monday), setpoint fields, temperature encoding (always Celsius), schedule modes, push/read flows, mode switching via shared bucket, continuation setpoints, custom schedules, debounce behavior (15-second sliding window), timestamp rejection, pending local change handling, auto-schedule learning caveat. Updated implementation checklist with schedule-related items. |
 | 1.8 | 2026-02-07 | Added "Batching multiple pushes" section under Server implementation notes. Explains how to send multiple chunks on a single subscribe connection using the device's 5-second closing timer reset behavior. |
 | 1.7 | 2026-02-07 | Corrected Home/Away mode section — use `manual_eco_all` + `manual_eco_timestamp` instead of `away` field. The `away` field triggers auto-eco which is overridden by schedule preconditioning. Added timestamp requirement (600s staleness window). Added guidance on field conflicts and exiting eco mode. |
 | 1.6 | 2026-02-07 | Added Home/Away mode section: structure bucket controls away state, device bucket away fields are read-only, eco temperature behavior, structure key selection for claimed vs unclaimed devices. Enhanced structure bucket `away` field description. |
