@@ -1353,6 +1353,7 @@ Controls the active temperature setpoint and HVAC mode. This is the primary buck
 | `target_temperature_low` | float | Read/write | Lower bound in range mode (Celsius) |
 | `target_temperature_type` | string | Read/write | HVAC mode: `heat`, `cool`, `range`, `emergency`, or `off`. See [HVAC modes](#hvac-modes). |
 | `target_change_pending` | boolean | Read/write | Pending temperature change flag. See [Display wake behavior](#display-wake-behavior). |
+| `touched_by` | object | Read | Metadata about the last temperature change source. See [Temperature change source tracking](#temperature-change-source-tracking). |
 | `schedule_mode` | string | Read/write | Active schedule mode: `HEAT`, `COOL`, or `RANGE`. See [Temperature schedules](#temperature-schedules). |
 | `can_heat` | boolean | Read | Device supports heating |
 | `can_cool` | boolean | Read | Device supports cooling |
@@ -1371,14 +1372,14 @@ Controls the active temperature setpoint and HVAC mode. This is the primary buck
 
 #### target_temperature vs schedule setpoints
 
-The `target_temperature` field represents the last **user or cloud override** — not the schedule-derived setpoint. The device evaluates its own schedule locally using internal timers and does not update `target_temperature` in the shared bucket when a schedule transition occurs.
+The `target_temperature` field in the shared bucket may be updated by schedule transitions, manual overrides (dial turns), or cloud pushes. The device evaluates its own schedule locally using internal timers. When a schedule transition fires, the device updates its internal setpoint and may update `target_temperature` in the shared bucket to reflect the new schedule value.
 
 This has critical implications for server implementations:
 
-- **Do not use `target_temperature` to track what the device is "set to."** After a schedule transition, the device's active setpoint changes locally, but `target_temperature` in the shared bucket still reflects the last manual or cloud-pushed value.
 - **Do not re-push a stale `target_temperature` to the device.** If your server pushes shared bucket data containing an old `target_temperature` value that differs from what the device currently has stored, the device treats it as a new cloud override and applies it — canceling the schedule-derived setpoint.
 - **Pushing `target_temperature` creates a temporary hold.** The device treats any cloud-pushed `target_temperature` as a manual override that persists until the next schedule transition. This is the intended mechanism for remote temperature control.
 - **The same-value guard prevents redundant overrides.** If the pushed `target_temperature` equals the value already stored in the shared bucket, the device ignores it (no event is fired). Problems only arise when the value differs.
+- **During eco mode, `target_temperature` tracks the schedule.** The schedule continues running underneath eco mode. Schedule transitions update `target_temperature` even while eco is active. The eco temperature override happens at the HVAC control layer, not the schedule layer.
 
 In practice, this means your server should only include `target_temperature` in a subscribe response when it has genuinely changed (for example, from a user action in your app). Simply echoing back the last known value on every subscribe can inadvertently override schedule transitions.
 
@@ -1445,6 +1446,31 @@ Server                              Device
   |                                   |
   |   [Server accepts false]          |  Don't push true again
 ```
+
+#### Temperature change source tracking
+
+The device tags every temperature setpoint with metadata describing what caused the change. This is serialized as a `touched_by` object in the shared bucket:
+
+```json
+{
+  "touched_by": {
+    "touched_by": 1,
+    "touched_at": 1707148800,
+    "touched_tzo": -18000,
+    "touched_user_id": ""
+  }
+}
+```
+
+| `touched_by` value | Source |
+|---------------------|--------|
+| `1` | Schedule transition |
+| `2` | Local user interaction (dial turn) |
+| `3` | Remote/cloud push |
+
+When a user turns the dial, the device creates a "temperature hold" that persists until the next schedule transition. The device displays "Holding until ..." on screen. There is no persistent hold flag — the hold implicitly expires when the schedule timer fires the next different-temperature setpoint.
+
+When pushing `target_temperature` from the cloud, set `touched_by.touched_by` to `3` and include a `touched_by.touched_user_id` if your server tracks user identity.
 
 ### structure bucket
 
@@ -2048,7 +2074,7 @@ The four state dimensions operate independently, but some combinations produce s
 | Set `target_temperature_type` to `"heat"` | → Heat | Schedule or manual setpoint | Unchanged | If below setpoint |
 | Set `target_temperature_type` to `"off"` | → Off | — | Unchanged | No |
 | Set `manual_eco_all` to `true` | Unchanged | → Eco temperatures | → Manual-eco | Only outside eco band |
-| Set `manual_eco_all` to `false` | Unchanged | → Schedule or manual setpoint | → Schedule | If below/above setpoint |
+| Set `manual_eco_all` to `false` | Unchanged | → Schedule setpoint (fresh lookup) | → Schedule | If below/above setpoint |
 | Push a new schedule | Unchanged | Updated for future transitions | Unchanged | Recalculated |
 | Safety threshold crossed | Overridden | Overridden | Overridden | Forced on |
 | Emergency mode set | → Emergency | Manual setpoint | Unchanged | Emergency heat |
@@ -2061,7 +2087,7 @@ Several features change behavior during eco mode.
 | Feature | Normal operation | During eco mode |
 |---------|-----------------|-----------------|
 | Preconditioning | Runs normally | **Blocked** (manual-eco only) |
-| Schedule following | Active | Suspended — eco temperatures used instead |
+| Schedule following | Active | Schedule timer continues running internally; HVAC uses eco temperatures instead of schedule setpoints |
 | Learning | Active | Paused |
 | Safety temperature | Active | Active — overrides eco |
 | Fan timer | Active | Active |
@@ -2166,7 +2192,9 @@ When in eco mode, the device uses `away_temperature_high` and `away_temperature_
 
 ### Exiting eco mode
 
-To exit eco mode, push `manual_eco_all: false` with a fresh `manual_eco_timestamp`. The device returns to its normal schedule and target temperature.
+To exit eco mode, push `manual_eco_all: false` with a fresh `manual_eco_timestamp`. The device performs a fresh schedule lookup and reverts to the current schedule setpoint for the time of day. Any previous manual temperature override (from a dial turn or cloud push) is **not** restored — the device always returns to the schedule.
+
+The schedule continues running internally during eco mode. If a schedule transition occurs while eco is active, the device's internal setpoint updates to the new schedule value. When eco exits, the device uses whatever the schedule currently says — which may be different from the setpoint that was active when eco started.
 
 The user can also exit eco mode by physically turning the dial on the thermostat. The device's occupancy sensor does **not** automatically exit manual eco mode — physical interaction or a server push is required.
 
@@ -2727,6 +2755,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.3 | 2026-02-09 | Eco mode and schedule interaction clarifications: schedule timer continues running during eco (not "suspended"), eco exit performs fresh schedule lookup (manual overrides not restored), `target_temperature` tracks schedule setpoints during eco mode. Added `touched_by` field to shared bucket fields table and new "Temperature change source tracking" section documenting the temperature hold mechanism. Corrected state interaction matrix eco exit row. |
 | 2.2 | 2026-02-09 | Fixed `target_temperature` example values from Fahrenheit (72.0) to Celsius (22.00000). Added critical "target_temperature vs schedule setpoints" section to shared bucket documentation explaining that `target_temperature` is a user/cloud override (not the schedule-derived setpoint), the device evaluates schedules locally, and re-pushing stale values overrides schedule transitions. |
 | 2.1 | 2026-02-08 | Added Thermostat control section: four-axis state model, HVAC modes (heat/cool/range/off/emergency) with validation against wiring capabilities, temperature setpoint control (single and dual setpoint with examples), device state reading guide (current conditions, equipment capabilities, HVAC operation mapping, eco state, time-to-target), comprehensive feature reference (fan, safety temperature, temperature lock, preconditioning, learning, humidity, sunblock, heat pump balance, radiant heat, hot water, smoke/CO safety shutoff, compressor lockout, display/sound, leaf thresholds, filter reminder), and state interaction matrix. Added `emergency` to shared bucket `target_temperature_type` values. Updated implementation checklist with mode validation, feature capability checks, and new avoid items. |
 | 2.0 | 2026-02-08 | Expanded Bucket types section into comprehensive reference: all 28 bucket types with object key formats, sync directions, and priority classification. Added device bucket field access modes (device-only, special, cloud-writable) with complete field lists by category (~97 writable, ~113 read-only). Added shared bucket conditional write semantics and corrected field list (moved `fan_timer_timeout` and `fan_timer_duration` to device bucket). Added structure bucket complete field list. Added hvac_partner, topaz, and kryptonite field tables with subscribe filters. Added write protection, safety fields, and schedule sync guard documentation. Fixed Home/Away section direction errors (`auto_away_enable`, `auto_away_reset`, `home_away_input` are bidirectional, not device-only). |
