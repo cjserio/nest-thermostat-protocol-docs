@@ -169,7 +169,7 @@ Transfer-Encoding: chunked
 X-nl-suspend-time-max: 600
 X-nl-service-timestamp: 1707148800000
 
-{"shared": {"object_revision": 457, "object_timestamp": 1707148800000, "object_key": "shared.09AA01AB12345678", "value": {"target_temperature": 72.0}}}
+{"shared": {"object_revision": 457, "object_timestamp": 1707148800000, "object_key": "shared.09AA01AB12345678", "value": {"target_temperature": 22.00000}}}
 ```
 
 #### Response headers
@@ -1020,7 +1020,7 @@ Transfer-Encoding: chunked
 X-nl-suspend-time-max: 600
 X-nl-service-timestamp: 1707148800000
 
-{"shared": {"object_revision": 458, "object_timestamp": 1707148800000, "object_key": "shared.SERIAL", "value": {"target_temperature": 72.0}}}
+{"shared": {"object_revision": 458, "object_timestamp": 1707148800000, "object_key": "shared.SERIAL", "value": {"target_temperature": 22.00000}}}
 ```
 
 #### Recommendations
@@ -1368,6 +1368,19 @@ Controls the active temperature setpoint and HVAC mode. This is the primary buck
 | `hvac_cool_x3_state` | boolean | Read | Stage 3 cooling running |
 | `hvac_fan_state` | boolean | Read | Fan running |
 | `name` | string | Read/write | Device display name |
+
+#### target_temperature vs schedule setpoints
+
+The `target_temperature` field represents the last **user or cloud override** — not the schedule-derived setpoint. The device evaluates its own schedule locally using internal timers and does not update `target_temperature` in the shared bucket when a schedule transition occurs.
+
+This has critical implications for server implementations:
+
+- **Do not use `target_temperature` to track what the device is "set to."** After a schedule transition, the device's active setpoint changes locally, but `target_temperature` in the shared bucket still reflects the last manual or cloud-pushed value.
+- **Do not re-push a stale `target_temperature` to the device.** If your server pushes shared bucket data containing an old `target_temperature` value that differs from what the device currently has stored, the device treats it as a new cloud override and applies it — canceling the schedule-derived setpoint.
+- **Pushing `target_temperature` creates a temporary hold.** The device treats any cloud-pushed `target_temperature` as a manual override that persists until the next schedule transition. This is the intended mechanism for remote temperature control.
+- **The same-value guard prevents redundant overrides.** If the pushed `target_temperature` equals the value already stored in the shared bucket, the device ignores it (no event is fired). Problems only arise when the value differs.
+
+In practice, this means your server should only include `target_temperature` in a subscribe response when it has genuinely changed (for example, from a user action in your app). Simply echoing back the last known value on every subscribe can inadvertently override schedule transitions.
 
 #### Temperature precision
 
@@ -2714,6 +2727,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.2 | 2026-02-09 | Fixed `target_temperature` example values from Fahrenheit (72.0) to Celsius (22.00000). Added critical "target_temperature vs schedule setpoints" section to shared bucket documentation explaining that `target_temperature` is a user/cloud override (not the schedule-derived setpoint), the device evaluates schedules locally, and re-pushing stale values overrides schedule transitions. |
 | 2.1 | 2026-02-08 | Added Thermostat control section: four-axis state model, HVAC modes (heat/cool/range/off/emergency) with validation against wiring capabilities, temperature setpoint control (single and dual setpoint with examples), device state reading guide (current conditions, equipment capabilities, HVAC operation mapping, eco state, time-to-target), comprehensive feature reference (fan, safety temperature, temperature lock, preconditioning, learning, humidity, sunblock, heat pump balance, radiant heat, hot water, smoke/CO safety shutoff, compressor lockout, display/sound, leaf thresholds, filter reminder), and state interaction matrix. Added `emergency` to shared bucket `target_temperature_type` values. Updated implementation checklist with mode validation, feature capability checks, and new avoid items. |
 | 2.0 | 2026-02-08 | Expanded Bucket types section into comprehensive reference: all 28 bucket types with object key formats, sync directions, and priority classification. Added device bucket field access modes (device-only, special, cloud-writable) with complete field lists by category (~97 writable, ~113 read-only). Added shared bucket conditional write semantics and corrected field list (moved `fan_timer_timeout` and `fan_timer_duration` to device bucket). Added structure bucket complete field list. Added hvac_partner, topaz, and kryptonite field tables with subscribe filters. Added write protection, safety fields, and schedule sync guard documentation. Fixed Home/Away section direction errors (`auto_away_enable`, `auto_away_reset`, `home_away_input` are bidirectional, not device-only). |
 | 1.9 | 2026-02-08 | Added Temperature schedules section: schedule bucket format, complete JSON schema (version 2), day indexing (0=Monday), setpoint fields, temperature encoding (always Celsius), schedule modes, push/read flows, mode switching via shared bucket, continuation setpoints, custom schedules, debounce behavior (15-second sliding window), timestamp rejection, pending local change handling, auto-schedule learning caveat. Updated implementation checklist with schedule-related items. |
