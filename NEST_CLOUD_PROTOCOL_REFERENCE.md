@@ -316,11 +316,11 @@ HTTP/1.1 200 OK
 Content-Type: application/json
 ```
 
-Return `200 OK` to acknowledge receipt. The response body is optional — an empty body or `{}` is sufficient.
+Return `200 OK` to acknowledge receipt.
 
-**If you include bucket data in the response** (using the same format as subscribe: `object_revision`, `object_timestamp`, `object_key`, `value`), the device applies the `value` contents as authoritative cloud data — the same code path as subscribe. Every field in `value` overwrites the device's local state for that bucket, with no per-key staleness check. This means including stale fields in the response (fields the device has updated locally since the PUT was sent) will silently revert those local changes.
+**The PUT response is a write receipt, not a data channel.** The server stores the device's fields, increments the revision, and returns `{object_revision, object_timestamp, object_key}`. No `value` field. Server-to-device data has exactly one path: subscribe.
 
-**Recommendation**: Return only `{object_revision, object_timestamp, object_key}` (the write acknowledgment) with no `value` field. Let all server-to-device data flow through subscribe, where the device's own timestamp comparison and embargo mechanisms provide some protection.
+The device has no per-key staleness protection. If you include a `value` field in the PUT response, the device applies every field in it as authoritative cloud data — the same code path as subscribe, no filtering, no comparison. Any field the device has updated locally since the PUT was sent (even milliseconds ago) will be silently overwritten. This includes conditional write (CAS) conflict responses: return the updated revision so the device can retry, but never include `value`.
 
 #### Errors
 
@@ -2767,7 +2767,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
-| 2.4 | 2026-02-11 | Clarified PUT response body semantics: `value` field is optional, but if present the device applies all fields as authoritative cloud data with no per-key staleness check. Added recommendation to return write acknowledgment only (no value echo). Added "Schedule transition PUT ordering" section explaining HVAC-first/temperature-second deterministic ordering and stale echo window. |
+| 2.4 | 2026-02-11 | Rewrote PUT response section: the PUT response is a write receipt, not a data channel — return `{object_revision, object_timestamp, object_key}` only, never include `value`. The device applies any `value` as authoritative cloud data with no per-key staleness check, silently overwriting local state. This applies to CAS conflict responses too. Added "Schedule transition PUT ordering" section explaining HVAC-first/temperature-second deterministic ordering and stale echo window. |
 | 2.3 | 2026-02-09 | Eco mode and schedule interaction clarifications: schedule timer continues running during eco (not "suspended"), eco exit performs fresh schedule lookup (manual overrides not restored), `target_temperature` tracks schedule setpoints during eco mode. Added `touched_by` field to shared bucket fields table and new "Temperature change source tracking" section documenting the temperature hold mechanism. Corrected state interaction matrix eco exit row. |
 | 2.2 | 2026-02-09 | Fixed `target_temperature` example values from Fahrenheit (72.0) to Celsius (22.00000). Added critical "target_temperature vs schedule setpoints" section to shared bucket documentation explaining that `target_temperature` is a user/cloud override (not the schedule-derived setpoint), the device evaluates schedules locally, and re-pushing stale values overrides schedule transitions. |
 | 2.1 | 2026-02-08 | Added Thermostat control section: four-axis state model, HVAC modes (heat/cool/range/off/emergency) with validation against wiring capabilities, temperature setpoint control (single and dual setpoint with examples), device state reading guide (current conditions, equipment capabilities, HVAC operation mapping, eco state, time-to-target), comprehensive feature reference (fan, safety temperature, temperature lock, preconditioning, learning, humidity, sunblock, heat pump balance, radiant heat, hot water, smoke/CO safety shutoff, compressor lockout, display/sound, leaf thresholds, filter reminder), and state interaction matrix. Added `emergency` to shared bucket `target_temperature_type` values. Updated implementation checklist with mode validation, feature capability checks, and new avoid items. |
