@@ -316,7 +316,11 @@ HTTP/1.1 200 OK
 Content-Type: application/json
 ```
 
-Return `200 OK` to acknowledge receipt. The response body is optional.
+Return `200 OK` to acknowledge receipt. The response body is optional — an empty body or `{}` is sufficient.
+
+**If you include bucket data in the response** (using the same format as subscribe: `object_revision`, `object_timestamp`, `object_key`, `value`), the device applies the `value` contents as authoritative cloud data — the same code path as subscribe. Every field in `value` overwrites the device's local state for that bucket, with no per-key staleness check. This means including stale fields in the response (fields the device has updated locally since the PUT was sent) will silently revert those local changes.
+
+**Recommendation**: Return only `{object_revision, object_timestamp, object_key}` (the write acknowledgment) with no `value` field. Let all server-to-device data flow through subscribe, where the device's own timestamp comparison and embargo mechanisms provide some protection.
 
 #### Errors
 
@@ -1382,6 +1386,14 @@ This has critical implications for server implementations:
 - **During eco mode, `target_temperature` tracks the schedule.** The schedule continues running underneath eco mode. Schedule transitions update `target_temperature` even while eco is active. The eco temperature override happens at the HVAC control layer, not the schedule layer.
 
 In practice, this means your server should only include `target_temperature` in a subscribe response when it has genuinely changed (for example, from a user action in your app). Simply echoing back the last known value on every subscribe can inadvertently override schedule transitions.
+
+#### Schedule transition PUT ordering
+
+When a schedule transition fires, the device sends HVAC state changes (e.g., `hvac_fan_state`, `hvac_heater_state`) and the new `target_temperature` in separate PUTs. The HVAC changes are sent first because they are synchronous and non-delayable. The temperature change is sent second because it goes through the defer delay mechanism (`X-nl-defer-device-window`).
+
+This creates a window where the server has received updated HVAC states but still holds the **previous** `target_temperature`. If the server pushes the shared bucket to the device during this window (via subscribe or PUT response), the stale `target_temperature` overwrites the schedule-derived setpoint.
+
+**Mitigation**: Set `X-nl-defer-device-window` to a non-zero value (e.g., 15–30 seconds). This causes the device to batch the temperature change into a single PUT along with any other pending changes, closing the window. Without this header, the device sends temperature changes immediately but in a separate PUT from the HVAC changes — maximizing the stale echo window.
 
 #### Temperature precision
 
@@ -2755,6 +2767,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.4 | 2026-02-11 | Clarified PUT response body semantics: `value` field is optional, but if present the device applies all fields as authoritative cloud data with no per-key staleness check. Added recommendation to return write acknowledgment only (no value echo). Added "Schedule transition PUT ordering" section explaining HVAC-first/temperature-second deterministic ordering and stale echo window. |
 | 2.3 | 2026-02-09 | Eco mode and schedule interaction clarifications: schedule timer continues running during eco (not "suspended"), eco exit performs fresh schedule lookup (manual overrides not restored), `target_temperature` tracks schedule setpoints during eco mode. Added `touched_by` field to shared bucket fields table and new "Temperature change source tracking" section documenting the temperature hold mechanism. Corrected state interaction matrix eco exit row. |
 | 2.2 | 2026-02-09 | Fixed `target_temperature` example values from Fahrenheit (72.0) to Celsius (22.00000). Added critical "target_temperature vs schedule setpoints" section to shared bucket documentation explaining that `target_temperature` is a user/cloud override (not the schedule-derived setpoint), the device evaluates schedules locally, and re-pushing stale values overrides schedule transitions. |
 | 2.1 | 2026-02-08 | Added Thermostat control section: four-axis state model, HVAC modes (heat/cool/range/off/emergency) with validation against wiring capabilities, temperature setpoint control (single and dual setpoint with examples), device state reading guide (current conditions, equipment capabilities, HVAC operation mapping, eco state, time-to-target), comprehensive feature reference (fan, safety temperature, temperature lock, preconditioning, learning, humidity, sunblock, heat pump balance, radiant heat, hot water, smoke/CO safety shutoff, compressor lockout, display/sound, leaf thresholds, filter reminder), and state interaction matrix. Added `emergency` to shared bucket `target_temperature_type` values. Updated implementation checklist with mode validation, feature capability checks, and new avoid items. |
