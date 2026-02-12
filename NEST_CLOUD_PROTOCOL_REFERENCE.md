@@ -2,8 +2,8 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 2.1
-**Last updated**: 2026-02-08
+**Revision**: 2.5
+**Last updated**: 2026-02-12
 **Author**: Chris Serio
 
 ---
@@ -39,6 +39,7 @@ Protocol specification for implementing a server that communicates with Nest the
   - [X-nl-disable-defer-window](#x-nl-disable-defer-window)
   - [X-nl-service-timestamp](#x-nl-service-timestamp)
 - [Timing reference](#timing-reference)
+  - [Connection hold time](#connection-hold-time)
   - [Concurrent PUT and subscribe](#concurrent-put-and-subscribe)
 - [Battery behavior](#battery-behavior)
 - [Bucket types](#bucket-types)
@@ -113,7 +114,7 @@ The Nest thermostat uses a long-polling HTTP protocol to maintain bidirectional 
 | Encoding | JSON request/response bodies |
 | Connection model | Device-initiated, server-held |
 | Push mechanism | Chunked transfer encoding |
-| Keep-alive | Device sends TCP keep-alives during sleep |
+| Keep-alive | WiFi hardware maintains connection during sleep |
 
 ---
 
@@ -655,10 +656,20 @@ Device                              Server
   |                                   |
   |        ... time passes ...        |
   |                                   |
-  |<-- JSON body ---------------------|  Server pushes update
+  |<-- JSON body ---------------------|  Server pushes update (optional)
   |                                   |
   |   [Device wakes in ~100-500ms]    |
   |   [Processes update]              |
+  |                                   |
+
+  ... OR if no data to push ...
+
+  |                                   |
+  |   [~590 seconds pass]            |
+  |                                   |
+  |<-- 0\r\n\r\n --------------------|  Server closes (hold time reached)
+  |                                   |
+  |   [Device wakes in ~100-500ms]    |
   |                                   |
   |-- POST /subscribe --------------->|  Device resubscribes
 ```
@@ -668,15 +679,16 @@ Device                              Server
 The device can sleep while maintaining the TCP connection. The WiFi hardware:
 
 1. Keeps the TCP socket open
-2. Sends periodic TCP keep-alive probes
-3. Monitors for incoming data
-4. Wakes the main CPU when data arrives
+2. Monitors for incoming data (WoWLAN)
+3. Wakes the main CPU when data arrives
 
 **From your server's perspective**:
 - The connection appears idle but remains open.
-- Your TCP stack automatically responds to keep-alive probes.
 - When you send data, the device wakes within ~100–500 ms.
 - No special action required—just send your chunked body.
+- Do **not** enable server-side `SO_KEEPALIVE`—the device does not respond to keep-alive probes while the CPU is asleep.
+
+> **Caution**: If the connection remains idle for approximately 360 seconds, the device considers it dead and resubscribes on a new connection—without closing the old one. Your server will briefly see two active subscriptions for the same device. To avoid this, keep your connection hold time under 350 seconds. See [Connection hold time](#connection-hold-time).
 
 > **Important**: For WoWLAN to work, your server URL must include an explicit port. See [Appendix: URL port requirement](#appendix-url-port-requirement).
 
@@ -684,12 +696,16 @@ The device can sleep while maintaining the TCP connection. The WiFi hardware:
 
 After sending chunked headers, the device may sleep at any moment. The connection remains open and you can push data whenever ready.
 
-| Event | Server Observes |
+| Event | Server observes |
 |-------|-----------------|
 | Device sleeps | Nothing. Connection stays open. |
 | You push data | Device wakes, processes data, resubscribes |
-| Suspend time expires | Device sends RST, then reconnects |
+| You close the connection | Device wakes, resubscribes |
 | Network failure | TCP timeout, then device reconnects |
+
+**The server controls the subscribe cycle.** The device doesn't close the connection on its own during normal operation. To drive the reconnect cycle, close the connection by sending the final chunk terminator (`0\r\n\r\n`). The device wakes, processes the close, and resubscribes.
+
+Your connection hold time (how long you keep the connection open before closing it) must be **shorter** than `X-nl-suspend-time-max`. See [Connection hold time](#connection-hold-time).
 
 ### Service tickle (administrative only)
 
@@ -708,7 +724,7 @@ Sending an empty body (0-byte chunk) forces the device to reconnect immediately.
 **Don't use for**:
 - "No updates available" (just hold the connection open)
 - "Keep device awake" (device sleeps anyway after reconnect)
-- Periodic heartbeats (TCP keep-alives handle this)
+- Periodic heartbeats (not needed—the server drives the cycle by closing the connection)
 
 ---
 
@@ -898,7 +914,9 @@ This header controls the **fallback wake timer**—the maximum time a device sle
 
 **Key insight**: When you push data to a sleeping device, it wakes in approximately 100–500 ms regardless of this value. The suspend time only determines how long until the device reconnects if you push nothing.
 
-| Value | Use Case |
+> **Critical**: Your server's connection hold time must be **shorter** than this value. The server closing the connection is the primary mechanism that drives the subscribe cycle. The device's wake timer is a safety net, not the driver. See [Connection hold time](#connection-hold-time).
+
+| Value | Use case |
 |-------|----------|
 | 300 | Unreliable network; faster recovery from connection drops |
 | **600** | **Recommended**. Good balance of battery life and reliability. |
@@ -1052,13 +1070,33 @@ These timers are internal to the device and cannot be controlled by the server.
 
 **Immediate timeout (7 seconds)**: If the server responds without `Transfer-Encoding: chunked`, the device expects the complete response body within 7 seconds. Use chunked encoding for long-poll connections to avoid this timeout.
 
+### Connection hold time
+
+The connection hold time is how long your server keeps a subscribe connection open before closing it. This value **must be shorter** than `X-nl-suspend-time-max`.
+
+The device maintains the TCP connection through CPU sleep using WiFi hardware offload. The device doesn't close the connection on its own during normal sleep cycles. Instead, the server drives the reconnect cycle by closing the connection (sending the final chunk terminator). When the server closes, the WiFi hardware wakes the CPU, and the device resubscribes.
+
+Two constraints apply to the connection hold time:
+
+1. **Must be shorter than `X-nl-suspend-time-max`**. Otherwise, the device's fallback wake timer fires first, causing unpredictable behavior.
+2. **Must be shorter than approximately 350 seconds**. If the connection is idle for about 360 seconds during sleep, the device considers it dead, abandons it without closing, and resubscribes on a new connection. This creates overlapping subscriptions.
+
+**Formula**: `connection_hold_time = X-nl-suspend-time-max - margin`
+
+A margin of 10 seconds is sufficient. Keep `X-nl-suspend-time-max` at or below 350 seconds.
+
+| `X-nl-suspend-time-max` | Connection hold time | Margin |
+|--------------------------|---------------------|--------|
+| **300** | **290** | **10** |
+| 350 | 340 | 10 |
+
 ### Recommended server configuration
 
 | Setting | Value | Rationale |
 |---------|-------|-----------|
-| `X-nl-suspend-time-max` | 600 | Balance of battery and reliability |
-| Server idle timeout | 900+ seconds | Must exceed suspend time |
-| Server TCP keep-alive | Disabled | Device handles keep-alives |
+| `X-nl-suspend-time-max` | 300 | Must be less than 350 to stay under idle connection timeout |
+| Connection hold time | 290 seconds | Must be shorter than suspend time (suspend - 10) |
+| Server `SO_KEEPALIVE` | Disabled | Device does not respond to keep-alive probes while asleep |
 | Response encoding | Chunked | Required for server push |
 
 ### Concurrent PUT and subscribe
@@ -2527,14 +2565,14 @@ If you need the schedule to remain exactly as pushed, the user must disable the 
 
 ### Connection errors
 
-| Error | Device Behavior | Server Observes |
+| Error | Device behavior | Server observes |
 |-------|-----------------|-----------------|
 | TCP timeout | Reconnect | Connection closes |
 | TLS failure | Retry | Handshake fails |
 | Keep-alive timeout | Reconnect | RST packet |
-| Wake timer expiry | Abort and reconnect | RST packet |
+| Wake timer expiry | Reconnect | Varies (RST or FIN) |
 
-**Note**: When the wake timer expires (`X-nl-suspend-time-max`), the device sends RST (not FIN). This is normal behavior, not an error.
+**Note**: The wake timer (`X-nl-suspend-time-max`) is a safety net. During normal operation, the server closes the connection before the timer fires. If the timer does fire (for example, if the server holds the connection too long), the device reconnects. To avoid this scenario, set your connection hold time shorter than `X-nl-suspend-time-max`. See [Connection hold time](#connection-hold-time).
 
 **HTTP 400 Retry Behavior**: The device retries HTTP 400 errors up to 2 times (3 total attempts) before giving up.
 
@@ -2552,8 +2590,8 @@ If you need the schedule to remain exactly as pushed, the user must disable the 
 - [ ] Return `Transfer-Encoding: chunked` on all subscribe responses
 - [ ] Return `X-nl-suspend-time-max` header (recommend: 600)
 - [ ] Keep connections open after sending headers
-- [ ] Set server idle timeout higher than suspend time (e.g., 900s)
-- [ ] Handle RST gracefully (device wake timer)
+- [ ] Set connection hold time shorter than `X-nl-suspend-time-max` (e.g., suspend - 10s)
+- [ ] Close idle connections by sending the final chunk terminator (`0\r\n\r\n`)
 - [ ] Store revision (int32) and timestamp (int64) for each bucket
 - [ ] Update both revision and timestamp atomically on every bucket write
 - [ ] Use timestamp as primary sync authority (not revision)
@@ -2594,11 +2632,11 @@ If you need the schedule to remain exactly as pushed, the user must disable the 
 
 ### Avoid
 
-- [ ] Closing connections after sending headers
+- [ ] Closing connections after sending headers (before hold time expires)
 - [ ] Using short `X-nl-suspend-time-max` for "responsiveness"
-- [ ] Sending server-side TCP keep-alives
+- [ ] Holding connections longer than `X-nl-suspend-time-max`
+- [ ] Sending server-side TCP keep-alives (device cannot respond while asleep)
 - [ ] Using service tickles for normal operation
-- [ ] Setting aggressive idle timeouts
 - [ ] Sending `object_key` before `object_revision`/`object_timestamp` in JSON responses
 - [ ] Using revision for sync decisions (use timestamp instead)
 - [ ] Sending entry key `expires` as a JSON string (must be a number)
@@ -2767,6 +2805,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.5 | 2026-02-12 | Corrected subscribe connection lifecycle: server controls the reconnect cycle, not the device wake timer. Added "Connection hold time" section — server must close the connection before `X-nl-suspend-time-max`. Updated connection timing table, normal operation diagram, recommended server configuration, error handling, and implementation checklist. The previous guidance that server hold time should exceed suspend time was incorrect. |
 | 2.4 | 2026-02-11 | Rewrote PUT response section: the PUT response is a write receipt, not a data channel — return `{object_revision, object_timestamp, object_key}` only, never include `value`. The device applies any `value` as authoritative cloud data with no per-key staleness check, silently overwriting local state. This applies to CAS conflict responses too. Added "Schedule transition PUT ordering" section explaining HVAC-first/temperature-second deterministic ordering and stale echo window. |
 | 2.3 | 2026-02-09 | Eco mode and schedule interaction clarifications: schedule timer continues running during eco (not "suspended"), eco exit performs fresh schedule lookup (manual overrides not restored), `target_temperature` tracks schedule setpoints during eco mode. Added `touched_by` field to shared bucket fields table and new "Temperature change source tracking" section documenting the temperature hold mechanism. Corrected state interaction matrix eco exit row. |
 | 2.2 | 2026-02-09 | Fixed `target_temperature` example values from Fahrenheit (72.0) to Celsius (22.00000). Added critical "target_temperature vs schedule setpoints" section to shared bucket documentation explaining that `target_temperature` is a user/cloud override (not the schedule-derived setpoint), the device evaluates schedules locally, and re-pushing stale values overrides schedule transitions. |
