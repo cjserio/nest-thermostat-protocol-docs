@@ -2,7 +2,7 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 2.5
+**Revision**: 2.6
 **Last updated**: 2026-02-12
 **Author**: Chris Serio
 
@@ -167,7 +167,7 @@ X-nl-protocol-version: 1
 ```http
 HTTP/1.1 200 OK
 Transfer-Encoding: chunked
-X-nl-suspend-time-max: 600
+X-nl-suspend-time-max: 300
 X-nl-service-timestamp: 1707148800000
 
 {"shared": {"object_revision": 457, "object_timestamp": 1707148800000, "object_key": "shared.09AA01AB12345678", "value": {"target_temperature": 22.00000}}}
@@ -649,7 +649,7 @@ Device                              Server
   |-- POST /subscribe --------------->|
   |                                   |
   |<-- 200 OK (chunked) --------------|
-  |    X-nl-suspend-time-max: 600     |
+  |    X-nl-suspend-time-max: 300     |
   |                                   |
   |   [Device may sleep any time]     |
   |   [TCP connection stays open]     |
@@ -665,7 +665,7 @@ Device                              Server
   ... OR if no data to push ...
 
   |                                   |
-  |   [~590 seconds pass]            |
+  |   [~290 seconds pass]            |
   |                                   |
   |<-- 0\r\n\r\n --------------------|  Server closes (hold time reached)
   |                                   |
@@ -776,7 +776,7 @@ When your server has data to push on a subscribe connection, you can batch multi
 
 Each chunk must be a complete `{"objects": [...]}` JSON document. The device parses each chunk independently. Its 5-second closing timer resets on every chunk received, so the connection remains valid as long as you keep sending data within that window.
 
-**Tradeoff**: Single-item pushes now wait 3 seconds before closing, in case more data arrives. The device stays awake for those extra seconds. This is negligible for wall-powered devices and acceptable for battery-powered devices given the 600-second suspend cycle.
+**Tradeoff**: Single-item pushes now wait 3 seconds before closing, in case more data arrives. The device stays awake for those extra seconds. This is negligible for wall-powered devices and acceptable for battery-powered devices given the 300-second suspend cycle.
 
 #### Batched flow vs single-push flow
 
@@ -901,12 +901,12 @@ Sets the maximum time (in seconds) before the device will wake and reconnect.
 #### Syntax
 
 ```http
-X-nl-suspend-time-max: 600
+X-nl-suspend-time-max: 300
 ```
 
 #### Value
 
-Integer representing seconds. Recommended range: 300-900.
+Integer representing seconds. Recommended range: 250-350.
 
 #### Description
 
@@ -918,16 +918,16 @@ This header controls the **fallback wake timer**—the maximum time a device sle
 
 | Value | Use case |
 |-------|----------|
-| 300 | Unreliable network; faster recovery from connection drops |
-| **600** | **Recommended**. Good balance of battery life and reliability. |
-| 900 | Maximum battery life; highly reliable network |
+| 250 | Unreliable network; faster recovery from connection drops |
+| **300** | **Recommended**. Good balance of battery life and reliability. |
+| 350 | Maximum value. Must stay under ~360s idle connection timeout. |
 
 #### Example
 
 ```http
 HTTP/1.1 200 OK
 Transfer-Encoding: chunked
-X-nl-suspend-time-max: 600
+X-nl-suspend-time-max: 300
 ```
 
 ---
@@ -1000,7 +1000,7 @@ When you push a temperature change to the device, you typically want immediate c
 ```http
 HTTP/1.1 200 OK
 Transfer-Encoding: chunked
-X-nl-suspend-time-max: 600
+X-nl-suspend-time-max: 300
 X-nl-service-timestamp: 1707148800000
 X-nl-disable-defer-window: 60
 
@@ -1039,7 +1039,7 @@ This header provides the server's authoritative timestamp for clock synchronizat
 ```http
 HTTP/1.1 200 OK
 Transfer-Encoding: chunked
-X-nl-suspend-time-max: 600
+X-nl-suspend-time-max: 300
 X-nl-service-timestamp: 1707148800000
 
 {"shared": {"object_revision": 458, "object_timestamp": 1707148800000, "object_key": "shared.SERIAL", "value": {"target_temperature": 22.00000}}}
@@ -1227,11 +1227,9 @@ These fields appear in PUT requests. Store them, but don't try to overwrite them
 | Field | Type | Description |
 |-------|------|-------------|
 | `current_temperature` | float | Current measured temperature (Celsius) |
-| `current_humidity` | float | Current relative humidity (percent) |
+| `current_humidity` | integer | Current relative humidity (percent) |
 | `backplate_temperature` | float | Backplate temperature (Celsius) |
 | `battery_level` | float | Battery charge level |
-| `can_heat` | boolean | Heating capability detected |
-| `can_cool` | boolean | Cooling capability detected |
 | `has_fan` | boolean | Fan control available |
 | `has_humidifier` | boolean | Humidifier detected |
 | `has_dehumidifier` | boolean | Dehumidifier detected |
@@ -2490,8 +2488,8 @@ The device validates the mode against its hardware capabilities:
 
 | Mode | Requires |
 |------|----------|
-| `HEAT` | Heat capability (`can_heat: true` in device bucket) |
-| `COOL` | Cool capability (`can_cool: true` in device bucket) |
+| `HEAT` | Heat capability (`can_heat: true` in shared bucket) |
+| `COOL` | Cool capability (`can_cool: true` in shared bucket) |
 | `RANGE` | Both heat and cool capability |
 
 If the device can't support the requested mode, it falls back to a mode its hardware supports.
@@ -2546,7 +2544,7 @@ Each day supports a maximum of 96 setpoints. In practice, schedules rarely have 
 
 The device has a built-in learning system that automatically modifies the schedule based on user behavior (dial turns, temperature holds). Cloud-pushed schedule changes are treated as user actions by the learning system, so the device may subsequently adjust the schedule you pushed.
 
-If you need the schedule to remain exactly as pushed, the user must disable the auto-schedule feature through the device settings. There is no server-side mechanism to disable learning.
+To prevent the device from modifying the pushed schedule, disable learning by pushing `learning_mode: false` in the device bucket before pushing the schedule.
 
 ---
 
@@ -2569,7 +2567,7 @@ If you need the schedule to remain exactly as pushed, the user must disable the 
 |-------|-----------------|-----------------|
 | TCP timeout | Reconnect | Connection closes |
 | TLS failure | Retry | Handshake fails |
-| Keep-alive timeout | Reconnect | RST packet |
+| Keep-alive timeout | Reconnect on new connection | Old connection goes stale (no FIN/RST) |
 | Wake timer expiry | Reconnect | Varies (RST or FIN) |
 
 **Note**: The wake timer (`X-nl-suspend-time-max`) is a safety net. During normal operation, the server closes the connection before the timer fires. If the timer does fire (for example, if the server holds the connection too long), the device reconnects. To avoid this scenario, set your connection hold time shorter than `X-nl-suspend-time-max`. See [Connection hold time](#connection-hold-time).
@@ -2588,7 +2586,7 @@ If you need the schedule to remain exactly as pushed, the user must disable the 
 - [ ] Implement `POST /entry` endpoint (returns `transport_url` with explicit port)
 - [ ] Implement `POST /{czid}/subscribe` endpoint
 - [ ] Return `Transfer-Encoding: chunked` on all subscribe responses
-- [ ] Return `X-nl-suspend-time-max` header (recommend: 600)
+- [ ] Return `X-nl-suspend-time-max` header (recommend: 300)
 - [ ] Keep connections open after sending headers
 - [ ] Set connection hold time shorter than `X-nl-suspend-time-max` (e.g., suspend - 10s)
 - [ ] Close idle connections by sending the final chunk terminator (`0\r\n\r\n`)
@@ -2666,7 +2664,7 @@ No updates available—hold connection open:
 ```http
 HTTP/1.1 200 OK
 Transfer-Encoding: chunked
-X-nl-suspend-time-max: 600
+X-nl-suspend-time-max: 300
 X-nl-service-timestamp: 1707148800000
 
 ```
@@ -2677,7 +2675,7 @@ X-nl-service-timestamp: 1707148800000
 ```http
 HTTP/1.1 200 OK
 Transfer-Encoding: chunked
-X-nl-suspend-time-max: 600
+X-nl-suspend-time-max: 300
 X-nl-service-timestamp: 1707148800000
 X-nl-disable-defer-window: 60
 
@@ -2693,7 +2691,7 @@ When multiple buckets have updates, use the `objects` array format:
 ```http
 HTTP/1.1 200 OK
 Transfer-Encoding: chunked
-X-nl-suspend-time-max: 600
+X-nl-suspend-time-max: 300
 X-nl-service-timestamp: 1707148800000
 
 {
@@ -2805,6 +2803,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.6 | 2026-02-12 | Fixed suspend-time-max contradiction: all examples and recommendations now use 300 (was 600 in most places, contradicting the ≤350 constraint from idle connection timeout). Fixed connection errors table: keep-alive timeout causes stale connection (no FIN/RST), not RST packet. Fixed "no server-side mechanism to disable learning" — `learning_mode` is cloud-writable (mode 2). Fixed `current_humidity` type from `float` to `integer`. Fixed `can_heat`/`can_cool` bucket references — fields are shared bucket only (removed incorrect device bucket listing, corrected schedule modes section). |
 | 2.5 | 2026-02-12 | Corrected subscribe connection lifecycle: server controls the reconnect cycle, not the device wake timer. Added "Connection hold time" section — server must close the connection before `X-nl-suspend-time-max`. Updated connection timing table, normal operation diagram, recommended server configuration, error handling, and implementation checklist. The previous guidance that server hold time should exceed suspend time was incorrect. |
 | 2.4 | 2026-02-11 | Rewrote PUT response section: the PUT response is a write receipt, not a data channel — return `{object_revision, object_timestamp, object_key}` only, never include `value`. The device applies any `value` as authoritative cloud data with no per-key staleness check, silently overwriting local state. This applies to CAS conflict responses too. Added "Schedule transition PUT ordering" section explaining HVAC-first/temperature-second deterministic ordering and stale echo window. |
 | 2.3 | 2026-02-09 | Eco mode and schedule interaction clarifications: schedule timer continues running during eco (not "suspended"), eco exit performs fresh schedule lookup (manual overrides not restored), `target_temperature` tracks schedule setpoints during eco mode. Added `touched_by` field to shared bucket fields table and new "Temperature change source tracking" section documenting the temperature hold mechanism. Corrected state interaction matrix eco exit row. |
