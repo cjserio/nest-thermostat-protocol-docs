@@ -2,8 +2,8 @@
 
 Protocol specification for implementing a server that communicates with Nest thermostat devices.
 
-**Revision**: 2.6
-**Last updated**: 2026-02-12
+**Revision**: 2.7
+**Last updated**: 2026-02-19
 **Author**: Chris Serio
 
 ---
@@ -63,15 +63,15 @@ Protocol specification for implementing a server that communicates with Nest the
   - [Read device state](#read-device-state)
   - [Feature reference](#feature-reference)
   - [State interactions](#state-interactions)
-- [Home/Away mode](#homeaway-mode)
-  - [Set away mode](#set-away-mode)
-  - [Set home mode](#set-home-mode)
-  - [Timestamp requirement](#timestamp-requirement)
-  - [Why not the away field?](#why-not-the-away-field)
+- [Home/Away and eco mode](#homeaway-and-eco-mode)
+  - [Enter eco mode](#enter-eco-mode)
+  - [Exit eco mode](#exit-eco-mode)
+  - [Eco temperatures](#eco-temperatures)
+  - [The `away` field](#the-away-field)
+  - [Read eco mode status](#read-eco-mode-status)
   - [Deliver the structure bucket](#deliver-the-structure-bucket)
   - [Choose the structure key](#choose-the-structure-key)
   - [Device bucket away fields](#device-bucket-away-fields)
-  - [Eco temperatures](#eco-temperatures)
   - [Exiting eco mode](#exiting-eco-mode)
 - [Temperature schedules](#temperature-schedules)
   - [Schedule bucket](#schedule-bucket)
@@ -1527,13 +1527,13 @@ Home-level settings that apply to all devices in a structure. The device never s
 **Object key**: `structure.{structureId}`
 **Direction**: Server &rarr; device only
 
-For eco mode control and structure key selection, see [Home/Away mode](#homeaway-mode).
+For eco mode control and structure key selection, see [Home/Away and eco mode](#homeaway-and-eco-mode).
 
 #### Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `away` | boolean | Legacy away flag. **Don't use for eco control** — overridden by schedule preconditioning. See [Home/Away mode](#homeaway-mode). |
+| `away` | boolean | Away state. Use `manual_eco_all` for direct eco control. See [Home/Away and eco mode](#homeaway-and-eco-mode). |
 | `manual_eco_all` | boolean | Eco mode control. `true` activates eco mode. |
 | `manual_eco_timestamp` | integer | Unix timestamp (seconds) of the eco change. **Must be within 600 seconds of device clock.** |
 | `house_type` | string | House type classification |
@@ -1543,7 +1543,7 @@ For eco mode control and structure key selection, see [Home/Away mode](#homeaway
 | `postal_code` | string | Postal/ZIP code |
 | `location` | object | Location data (zipcode, country, latitude, longitude) |
 | `time_zone` | object | Timezone information |
-| `devices` | string | Comma-separated device object keys (for example, `device.09AA01AC12345678`) |
+| `devices` | array | JSON array of device object keys (for example, `["device.09AA01AC12345678"]`) |
 | `name` | string | Structure name |
 | `dr_reminder_enabled` | boolean | Demand response reminders enabled |
 
@@ -1730,7 +1730,7 @@ The server doesn't need to process them in order. This is documented for debuggi
 
 The previous sections cover the transport protocol and data model. This section explains how to use those primitives to control the thermostat — setting modes, changing temperatures, reading state, and configuring features.
 
-For eco mode (home/away) control, see [Home/Away mode](#homeaway-mode). For schedule management, see [Temperature schedules](#temperature-schedules).
+For eco mode control, see [Home/Away and eco mode](#homeaway-and-eco-mode). For schedule management, see [Temperature schedules](#temperature-schedules).
 
 ### State model
 
@@ -1921,15 +1921,7 @@ The device reports its eco mode through the `eco_mode` field in the device bucke
 {"mode":"manual-eco","touched_by":3,"mode_update_timestamp":1738800000,"touched_user_id":"userId"}
 ```
 
-The `mode` value is one of:
-
-| Value | Meaning |
-|-------|---------|
-| `"schedule"` | Normal operation (home) |
-| `"auto-eco"` | Occupancy-driven eco (unreliable — see [Why not the away field?](#why-not-the-away-field)) |
-| `"manual-eco"` | Server-set eco (reliable — set through `manual_eco_all`) |
-
-For controlling eco mode, see [Home/Away mode](#homeaway-mode).
+The `mode` value indicates the current eco state. For the full list of values and how to control eco mode, see [Home/Away and eco mode](#homeaway-and-eco-mode).
 
 #### Time to target
 
@@ -1996,7 +1988,7 @@ Starts heating or cooling early so the home reaches the target temperature at th
 | `eta_preconditioning_active` | Device → server | boolean | Currently preconditioning |
 | `max_nighttime_preconditioning_seconds` | Bidirectional | integer | Maximum preconditioning duration at night (seconds) |
 
-> **Note:** Preconditioning is automatically blocked during manual eco mode. This is the mechanism that makes `manual_eco_all` reliable for away control — see [Home/Away mode](#homeaway-mode).
+> **Note:** Preconditioning is automatically blocked during server-initiated eco mode (`manual_eco_all`). See [Home/Away and eco mode](#homeaway-and-eco-mode).
 
 #### Learning mode
 
@@ -2100,6 +2092,7 @@ The green leaf icon appears when the current setpoint is energy-efficient. The s
 |-------|-----------|------|-------------|
 | `leaf_threshold_heat` | Bidirectional | float | Leaf appears below this heating setpoint (°C) |
 | `leaf_threshold_cool` | Bidirectional | float | Leaf appears above this cooling setpoint (°C) |
+| `leaf_schedule_delta` | Bidirectional | float | Offset from schedule setpoint used to compute leaf thresholds (°C). The device's learning algorithm adjusts this over time. |
 | `leaf_away_low` | Bidirectional | float | Eco heating threshold for leaf (°C) |
 | `leaf_away_high` | Bidirectional | float | Eco cooling threshold for leaf (°C) |
 | `leaf` | Device → server | boolean | Whether the leaf icon is currently displayed |
@@ -2142,13 +2135,15 @@ Several features change behavior during eco mode.
 
 ---
 
-## Home/Away mode
+## Home/Away and eco mode
 
-Eco mode is controlled through the **structure bucket** using the `manual_eco_all` and `manual_eco_timestamp` fields. When the device receives `manual_eco_all` set to `true`, it switches to eco mode and uses eco temperatures. Setting it to `false` restores normal schedule operation.
+Eco mode is an energy-saving state where the device relaxes its temperature targets. Instead of following the active schedule, the device uses wider temperature bounds — only running the HVAC if the indoor temperature crosses a high or low threshold. When eco mode ends, the device resumes the current schedule setpoint.
 
-### Set away mode
+Your server controls eco mode through the **structure bucket**. The device also has a built-in occupancy sensor that can trigger eco independently, but server-initiated eco takes priority.
 
-Push a structure bucket with `manual_eco_all` and `manual_eco_timestamp` in the subscribe response:
+### Enter eco mode
+
+To activate eco mode, set `manual_eco_all` to `true` in the structure bucket. Eco mode takes effect as soon as the device processes the update.
 
 ```json
 {
@@ -2166,11 +2161,11 @@ Push a structure bucket with `manual_eco_all` and `manual_eco_timestamp` in the 
 }
 ```
 
-The device applies eco temperatures automatically. It uses the `away_temperature_high` and `away_temperature_low` fields from the device bucket as eco setpoints.
+Include a `manual_eco_timestamp` set to the current Unix time in **seconds** (not milliseconds). The device rejects the change if this timestamp differs from its own clock by more than **600 seconds**. Keep your server clock NTP-synced.
 
-### Set home mode
+### Exit eco mode
 
-Push `manual_eco_all: false` the same way:
+To deactivate eco mode, send `manual_eco_all: false` and `away: false` in the structure bucket, and write `eco.mode: "schedule"` to the device bucket:
 
 ```json
 {
@@ -2181,30 +2176,69 @@ Push `manual_eco_all: false` the same way:
       "object_key": "structure.your_structure_id",
       "value": {
         "manual_eco_all": false,
-        "manual_eco_timestamp": 1707148801
+        "manual_eco_timestamp": 1707148801,
+        "away": false
+      }
+    },
+    {
+      "object_revision": 7,
+      "object_timestamp": 1707148801000,
+      "object_key": "device.your_serial_number",
+      "value": {
+        "eco": {
+          "mode": "schedule",
+          "touched_by": 3,
+          "mode_update_timestamp": 1707148801
+        }
       }
     }
   ]
 }
 ```
 
-The device restores its normal target temperature and schedule.
+> **Caution**: Always include `away: false` when exiting eco mode. The `manual_eco_all` field is subject to the same 600-second timestamp validation on exit as on entry — if the device's clock has drifted, it silently drops the change and eco mode persists. The `away` field has no timestamp validation, so it always takes effect and serves as a reliable fallback.
+>
+> **Caution**: Always include the device bucket `eco.mode: "schedule"` write when exiting eco mode. If your server pushes other device bucket fields in the same subscribe response (which is typical), the device processes the entire merged object. Any stale `eco.mode: "manual-eco"` left over from a previous write will cause the device to re-enter eco mode immediately after the structure bucket exits it. Writing `eco.mode: "schedule"` explicitly overwrites any stale value.
 
-### Timestamp requirement
+After exiting eco mode, the device performs a fresh schedule lookup. Any previous manual temperature override (from a dial turn or server push) is not restored — the device uses whatever the schedule says at that moment.
 
-The `manual_eco_timestamp` field must be within **600 seconds** of the device's internal clock. If the timestamp is stale, the device silently ignores the eco mode change — no error is returned.
+The user can also exit eco mode by physically turning the thermostat dial. The occupancy sensor does not automatically exit server-initiated eco — only a physical interaction or a server push clears it.
 
-Use current Unix time in **seconds** (not milliseconds) when pushing eco mode changes. Ensure your server's clock is NTP-synced to avoid timestamp drift.
+### Eco temperatures
 
-### Why not the `away` field?
+During eco mode, the device uses `away_temperature_high` and `away_temperature_low` from the device bucket as its setpoints. These define the bounds: the device heats if the temperature drops below `away_temperature_low`, and cools if it rises above `away_temperature_high`. Both fields are cloud-writable.
 
-The structure bucket also has an `away` field, but don't use it for eco mode control. The `away` field triggers a different internal eco mode that the device's schedule preconditioning overrides within seconds. The `manual_eco_all` field triggers a persistent eco mode that the device respects through schedule changes.
+These are separate from the `target_temperature` fields in the shared bucket, which continue to track the active schedule during eco mode.
 
-Do **not** push both `away` and `manual_eco_all` simultaneously — they conflict internally and produce unpredictable results.
+### The `away` field
+
+The structure bucket also has an `away` field that provides a second way to trigger eco mode. When the device receives `away: true`, it starts a timer. If the timer expires without being cancelled, the device enters eco mode on its own.
+
+The key differences from `manual_eco_all`:
+
+| | `manual_eco_all` | `away` |
+|-|-------------------|--------|
+| Activation | Immediate | Delayed (device timer) |
+| Timestamp validation | Yes (600-second window) | `away: true` validated, `away: false` is not |
+| Schedule preconditioning | Blocked during eco | Can end eco early |
+
+The `away` field is designed for occupancy-based automation. If your server tracks whether anyone is home, set `away: true` when the home is unoccupied and `away: false` when someone returns. The built-in delay prevents false triggers from brief absences.
+
+For direct eco control — for example, a user tapping an "Eco" button in your app — use `manual_eco_all`. The immediate activation provides a better user experience, and eco mode won't be interrupted by the device's schedule.
+
+### Read eco mode status
+
+The device reports its current eco state through the `eco_mode` field in the [device bucket](#device-bucket):
+
+| Value | Meaning |
+|-------|---------|
+| `"schedule"` | Not in eco mode. Following the schedule normally. |
+| `"manual-eco"` | Server-initiated eco (set through `manual_eco_all`). |
+| `"auto-eco"` | Device-initiated eco (occupancy sensor or `away` timer). |
 
 ### Deliver the structure bucket
 
-The device doesn't explicitly subscribe to the structure bucket. Your server must include it as an additional object in the subscribe response — the same mechanism used for [pairing](#pairing).
+The device doesn't subscribe to the structure bucket by default. Your server must include it as an additional object in the subscribe response — the same mechanism used for [pairing](#pairing).
 
 Once the device receives a structure bucket, it remembers the structure key and includes it in subsequent subscribe requests. From that point on, the device expects structure updates through the normal subscribe flow.
 
@@ -2214,37 +2248,25 @@ For the initial delivery (before the device knows about the structure), include 
 
 | Scenario | Structure key | Example |
 |----------|---------------|---------|
-| Device has an owner (claimed) | Derive from user/owner identity | `structure.user123` |
+| Device has an owner (claimed) | Derive from user or owner identity | `structure.user123` |
 | Device has no owner (unclaimed) | Use `structure.default` | `structure.default` |
 
-For unclaimed devices, use `structure.default` as the structure key. The device processes it the same way regardless of the key name — what matters is that the bucket type is `structure`.
+The device processes the bucket the same way regardless of the key name — what matters is that the bucket type is `structure`.
 
 ### Device bucket away fields
 
-The device bucket contains several away-related fields. The `auto_away` field is device-only (read-only from the server). The others are cloud-writable but **don't control eco mode** — use the structure bucket's `manual_eco_all` field instead.
+The device bucket contains several away-related fields. The `auto_away` field is read-only (device to server). The others are cloud-writable but don't control eco mode — use the structure bucket fields instead.
 
 | Field | Type | Direction | Description |
 |-------|------|-----------|-------------|
 | `auto_away` | integer | Device &rarr; server | Occupancy sensor output. `0` = home, `1` = away. |
 | `auto_away_enable` | boolean | Bidirectional | Whether the occupancy sensor is active. |
-| `auto_away_reset` | boolean | Bidirectional | Reset auto-away to home state. |
+| `auto_away_reset` | boolean | Bidirectional | Reset occupancy learning data (sensor history, not eco state). |
 | `home_away_input` | boolean | Bidirectional | Enable home/away feature globally. |
 | `away_temperature_high` | float | Bidirectional | Upper eco temperature (Celsius). |
 | `away_temperature_low` | float | Bidirectional | Lower eco temperature (Celsius). |
 
-> **Warning**: Don't write `auto_away` to the device bucket expecting to control eco mode — it's a read-only sensor output. For the complete list of device bucket fields and their access modes, see [device bucket](#device-bucket).
-
-### Eco temperatures
-
-When in eco mode, the device uses `away_temperature_high` and `away_temperature_low` from the device bucket as its setpoints. These are set by the device itself (based on user preferences) and can also be pushed from the server. They are separate from the normal `target_temperature` fields in the shared bucket.
-
-### Exiting eco mode
-
-To exit eco mode, push `manual_eco_all: false` with a fresh `manual_eco_timestamp`. The device performs a fresh schedule lookup and reverts to the current schedule setpoint for the time of day. Any previous manual temperature override (from a dial turn or cloud push) is **not** restored — the device always returns to the schedule.
-
-The schedule continues running internally during eco mode. If a schedule transition occurs while eco is active, the device's internal setpoint updates to the new schedule value. When eco exits, the device uses whatever the schedule currently says — which may be different from the setpoint that was active when eco started.
-
-The user can also exit eco mode by physically turning the dial on the thermostat. The device's occupancy sensor does **not** automatically exit manual eco mode — physical interaction or a server push is required.
+> **Caution**: Don't write `auto_away` to the device bucket to control eco mode — it's a read-only sensor output. For the complete list of device bucket fields and their access modes, see [device bucket](#device-bucket).
 
 ---
 
@@ -2792,7 +2814,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 | Authentication | Provisional |
 | Pairing | Complete |
 | Bucket types | Complete |
-| Home/Away mode | Complete |
+| Home/Away and eco mode | Complete |
 | Thermostat control | Complete |
 | Temperature schedules | Complete |
 | Error handling | Partial |
@@ -2803,6 +2825,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.7 | 2026-02-19 | Rewrote Home/Away and eco mode section. Corrected eco exit guidance: `manual_eco_all: false` can be silently dropped due to 600-second timestamp validation (not "re-entered" as previously stated). Always send `away: false` alongside for reliable exit. Restructured section around developer tasks (enter, exit, read status) instead of internal firmware paths. Added comparison table for `manual_eco_all` vs `away`. Added eco mode status reading section. Removed internal terminology ("manual eco"/"auto eco" as mode names). |
 | 2.6 | 2026-02-12 | Fixed suspend-time-max contradiction: all examples and recommendations now use 300 (was 600 in most places, contradicting the ≤350 constraint from idle connection timeout). Fixed connection errors table: keep-alive timeout causes stale connection (no FIN/RST), not RST packet. Fixed "no server-side mechanism to disable learning" — `learning_mode` is cloud-writable (mode 2). Fixed `current_humidity` type from `float` to `integer`. Fixed `can_heat`/`can_cool` bucket references — fields are shared bucket only (removed incorrect device bucket listing, corrected schedule modes section). |
 | 2.5 | 2026-02-12 | Corrected subscribe connection lifecycle: server controls the reconnect cycle, not the device wake timer. Added "Connection hold time" section — server must close the connection before `X-nl-suspend-time-max`. Updated connection timing table, normal operation diagram, recommended server configuration, error handling, and implementation checklist. The previous guidance that server hold time should exceed suspend time was incorrect. |
 | 2.4 | 2026-02-11 | Rewrote PUT response section: the PUT response is a write receipt, not a data channel — return `{object_revision, object_timestamp, object_key}` only, never include `value`. The device applies any `value` as authoritative cloud data with no per-key staleness check, silently overwriting local state. This applies to CAS conflict responses too. Added "Schedule transition PUT ordering" section explaining HVAC-first/temperature-second deterministic ordering and stale echo window. |
