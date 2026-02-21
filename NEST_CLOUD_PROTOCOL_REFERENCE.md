@@ -136,9 +136,11 @@ X-nl-protocol-version: 1
 
 {
   "chunked": true,
-  "session": "session_id",
-  "device": {"object_key": "device.SERIAL", "object_revision": 123, "object_timestamp": 1234567890},
-  "shared": {"object_key": "shared.SERIAL", "object_revision": 456, "object_timestamp": 1234567890}
+  "session": "18b430deadbeefSERIAL",
+  "objects": [
+    {"object_key": "device.SERIAL", "object_revision": 3, "object_timestamp": 1707148800000},
+    {"object_key": "shared.SERIAL", "object_revision": 2, "object_timestamp": 1707148800000}
+  ]
 }
 ```
 
@@ -148,19 +150,23 @@ X-nl-protocol-version: 1
 |--------|----------|-------------|
 | `X-nl-protocol-version` | Yes | Protocol version. Always `1`. |
 | `X-nl-device-swversion` | No | Device software version string. |
-| `X-nl-longest-wake` | No | Vestigial. Running max of subscribe connection durations (seconds); never resets. Server ignores. |
-| `X-nl-client-id` | No | Not sent on production firmware. See [Device identification](#device-identification). |
+| `X-nl-longest-wake` | No | Vestigial. Running max of subscribe connection durations (seconds); never resets. Safe to ignore. |
+| `X-nl-client-id` | No | Not sent by production firmware. See [Device identification](#device-identification). |
 
 #### Request body
 
+The device sends its current bucket state so your server can determine which buckets need updating. The device sends bucket data in an `objects` array.
+
 | Field | Type | Description |
 |-------|------|-------------|
-| `chunked` | boolean | Always `true`. Device requests chunked response. |
-| `session` | string | Device session identifier. The device reuses this value across requests; don't use it as a unique subscription key. See [Session ID behavior](#session-id-behavior). |
-| `{bucket}` | object | One entry per bucket with current revision info. |
-| `{bucket}.object_key` | string | Bucket identifier, typically `{bucket}.{serial}`. |
-| `{bucket}.object_revision` | integer | Device's current revision number for this bucket. |
-| `{bucket}.object_timestamp` | integer | Unix timestamp of last update. |
+| `chunked` | boolean | Always `true`. The device expects a chunked response. |
+| `session` | string | A persistent session identifier that the device reuses across requests. Don't use this as a unique subscription key. See [Session ID behavior](#session-id-behavior). |
+| `objects` | array | Array of bucket descriptors representing the device's current state. |
+| `objects[].object_key` | string | Bucket identifier (for example, `device.09AA01AB12345678`). |
+| `objects[].object_revision` | integer | The device's current revision for this bucket. |
+| `objects[].object_timestamp` | integer | Timestamp in milliseconds since Unix epoch. |
+
+> **Caution**: Your server must parse the `objects` array format. Some earlier documentation showed bucket data as top-level keys (for example, `"device": {"object_key": ...}`). Production firmware does not use that format.
 
 #### Response
 
