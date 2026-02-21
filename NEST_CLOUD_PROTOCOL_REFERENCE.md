@@ -149,7 +149,7 @@ X-nl-protocol-version: 1
 | `X-nl-protocol-version` | Yes | Protocol version. Always `1`. |
 | `X-nl-device-swversion` | No | Device software version string. |
 | `X-nl-longest-wake` | No | Vestigial. Running max of subscribe connection durations (seconds); never resets. Server ignores. |
-| `X-nl-client-id` | No | Sent when device has no valid session. |
+| `X-nl-client-id` | No | Not sent on production firmware. See [Device identification](#device-identification). |
 
 #### Request body
 
@@ -265,7 +265,7 @@ X-nl-protocol-version: 1
 | Header | Required | Description |
 |--------|----------|-------------|
 | `X-nl-protocol-version` | Yes | Protocol version. Always `1`. |
-| `X-nl-client-id` | No | Sent when device has no valid session. |
+| `X-nl-client-id` | No | Not sent on production firmware. See [Device identification](#device-identification). |
 | `X-nl-device-swversion` | No | Device software version string. |
 | `Content-Type` | Yes | Must be `application/json`. |
 
@@ -388,7 +388,7 @@ Initial device registration endpoint. The device contacts this endpoint on first
 POST /entry HTTP/1.1
 Host: your-server.example.com
 Content-Type: application/x-www-form-urlencoded
-X-nl-device-id: 09AA01AB12345678
+Authorization: Basic <base64(userid:password)>
 
 reset=FALSE&mac=18B430ABCDEF&model=Diamond-2.6&request_id=1&software_version=5.9.3-5&wireless_reg_domain=US&backplate_model=Backplate-2.1
 ```
@@ -397,8 +397,11 @@ reset=FALSE&mac=18B430ABCDEF&model=Diamond-2.6&request_id=1&software_version=5.9
 
 | Header | Required | Description |
 |--------|----------|-------------|
-| `X-nl-device-id` | Yes | Device serial number. |
+| `Authorization` | Yes* | HTTP Basic Authentication. The user ID contains the device serial (`d.{SERIAL}.{suffix}`). Always present on production firmware. |
+| `X-nl-device-id` | No | Device serial number. Not sent on production firmware. See [Device identification](#device-identification). |
 | `Content-Type` | Yes | Must be `application/x-www-form-urlencoded`. |
+
+> \* On production firmware, `Authorization` is always present. Some non-production configurations send `X-nl-device-id` instead. Your server should handle both: parse the serial from the Basic Auth user ID when present, fall back to `X-nl-device-id` otherwise.
 
 #### Request body (form-urlencoded)
 
@@ -468,18 +471,25 @@ Content-Type: application/json
 
 > **Note**: The device's authentication and pairing system was designed for Google's cloud infrastructure and companion mobile app. That architecture handles credential provisioning, account linking, and pairing through a coordinated flow between the phone, cloud, and device — none of which exists in a home server deployment. The approaches documented here are functional but may not cover all firmware edge cases. If you encounter unexpected behavior, [file an issue](https://github.com/cjserio/nest-thermostat-protocol-docs/issues).
 
-Authentication is optional. The device supports HTTP Basic Authentication for subscribe and put requests, but you can also identify devices entirely through HTTP headers without provisioning credentials.
+On production firmware, the device **always** uses HTTP Basic Authentication for subscribe and PUT requests. The credential user ID follows the format `d.{SERIAL}.{suffix}`, so you can extract the device serial from every authenticated request.
 
 ### Device identification
 
-Even without credentials, the device identifies itself in every request through HTTP headers:
+The device identifies itself through the HTTP Basic Authentication `Authorization` header on every subscribe and PUT request. Decode the Base64 credentials and extract the user ID — the serial number is the second dot-delimited segment:
+
+```
+Authorization: Basic <base64(userid:password)>
+→ userid = "d.09AA01AB12345678.BC7C9039"
+→ serial = "09AA01AB12345678"
+```
+
+The firmware also supports `X-nl-client-id` and `X-nl-device-id` headers, but these are **not sent on production firmware**. They may appear in non-standard configurations, so your server should accept them as a fallback, but do not rely on them for device identification.
 
 | Header | Format | Sent when | Found in |
 |--------|--------|-----------|----------|
-| `X-nl-client-id` | `d.{SERIAL}.{random}` | Device has no valid credential session | Subscribe and PUT requests |
-| `X-nl-device-id` | `{SERIAL}` (bare serial) | Device has no valid credential session | Entry (frontdoor) requests |
-
-Both headers identify the device by serial number. `X-nl-device-id` is the bare serial. `X-nl-client-id` requires parsing — extract the second dot-delimited segment to get the serial (e.g., `d.09AA01AB12345678.BC7C9039` → `09AA01AB12345678`).
+| `Authorization` | `Basic <base64>` | Always (production firmware) | Subscribe, PUT, and entry requests |
+| `X-nl-client-id` | `d.{SERIAL}.{suffix}` | Non-production only | Subscribe and PUT requests |
+| `X-nl-device-id` | `{SERIAL}` (bare serial) | Non-production only | Entry requests |
 
 ### Credential types
 
@@ -508,17 +518,17 @@ The format is space-separated `userid` and `password`. The device stores these v
 
 For home server deployments, the simplest and most reliable approach is to skip credential provisioning entirely:
 
-1. Accept all subscribe and put requests regardless of credentials.
-2. Identify devices by the `X-nl-client-id` or `X-nl-device-id` header.
+1. Accept all subscribe and PUT requests regardless of credentials (don't return 401).
+2. Parse the Basic Auth user ID from the `Authorization` header to extract the device serial.
 3. Look up the device serial in your database.
 
-This avoids credential management complexity and the credential loop described above.
+This avoids credential management complexity and the credential loop described above. The device always sends Basic Auth (even with default credentials), so the serial is always available.
 
 | Endpoint | Authentication required |
 |----------|------------------------|
 | `POST /entry` | No |
-| `POST /{czid}/subscribe` | No (identify by header) |
-| `POST /{czid}/put` | No (identify by header) |
+| `POST /{czid}/subscribe` | No (identify by Basic Auth user ID) |
+| `POST /{czid}/put` | No (identify by Basic Auth user ID) |
 | `GET {passphrase_url}` | No |
 
 ### Entry key
@@ -2831,6 +2841,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.8 | 2026-02-21 | Corrected device identification: on production firmware, the device **always** uses HTTP Basic Authentication (never sends `X-nl-client-id` or `X-nl-device-id` headers). Updated subscribe, PUT, and entry header tables. Rewrote Device Identification section around Basic Auth credential ID parsing. Updated recommended approach to use Basic Auth user ID instead of identity headers. Fixed entry request example to show `Authorization` header. Identity headers documented as non-production fallback. |
 | 2.7 | 2026-02-19 | Rewrote Home/Away and eco mode section. Corrected eco exit guidance: `manual_eco_all: false` can be silently dropped due to 600-second timestamp validation (not "re-entered" as previously stated). Always send `away: false` alongside for reliable exit. Restructured section around developer tasks (enter, exit, read status) instead of internal firmware paths. Added comparison table for `manual_eco_all` vs `away`. Added eco mode status reading section. Removed internal terminology ("manual eco"/"auto eco" as mode names). |
 | 2.6 | 2026-02-12 | Fixed suspend-time-max contradiction: all examples and recommendations now use 300 (was 600 in most places, contradicting the ≤350 constraint from idle connection timeout). Fixed connection errors table: keep-alive timeout causes stale connection (no FIN/RST), not RST packet. Fixed "no server-side mechanism to disable learning" — `learning_mode` is cloud-writable (mode 2). Fixed `current_humidity` type from `float` to `integer`. Fixed `can_heat`/`can_cool` bucket references — fields are shared bucket only (removed incorrect device bucket listing, corrected schedule modes section). |
 | 2.5 | 2026-02-12 | Corrected subscribe connection lifecycle: server controls the reconnect cycle, not the device wake timer. Added "Connection hold time" section — server must close the connection before `X-nl-suspend-time-max`. Updated connection timing table, normal operation diagram, recommended server configuration, error handling, and implementation checklist. The previous guidance that server hold time should exceed suspend time was incorrect. |
