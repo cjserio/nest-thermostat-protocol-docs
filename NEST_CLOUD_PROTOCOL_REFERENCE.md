@@ -1204,7 +1204,7 @@ The device recognizes 28 bucket types. Most server implementations only need to 
 
 ### device bucket
 
-The largest bucket. Contains device telemetry, configuration, hardware state, and sensor readings. The device sends ~198 fields on a full sync after boot.
+The largest bucket (239 registered fields). Contains device telemetry, configuration, hardware state, and sensor readings.
 
 **Object key**: `device.{serial}`
 **Direction**: Bidirectional (with per-field restrictions)
@@ -1216,34 +1216,35 @@ Every field in the device bucket has one of three access modes that determine wh
 
 | Mode | Count | Server can write? | In PUT? | Description |
 |------|-------|-------------------|---------|-------------|
-| Device-only | ~113 | **No** — device rejects and overwrites. See [Write protection](#write-protection). | Yes | Hardware state, sensors, computed values |
-| Special | ~29 | Varies | No | Custom processing paths (eco, HVAC capacities). Not in standard PUT. |
-| Cloud-writable | ~97 | **Yes** | Yes | Configuration the server can push. |
+| Device-only | 113 | **No** — device rejects and overwrites. See [Write protection](#write-protection). | Yes | Hardware state, sensors, computed values |
+| Special | 23 | Varies | No | Custom processing paths (eco, HVAC capacities). Not in standard PUT. |
+| Cloud-writable | 103 | **Yes** | Yes | Configuration the server can push. |
 
 #### Key read-only fields
 
 These fields appear in PUT requests. Store them, but don't try to overwrite them — the device ignores or actively reverts server writes to these fields.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `current_temperature` | float | Current measured temperature (Celsius) |
-| `current_humidity` | integer | Current relative humidity (percent) |
-| `backplate_temperature` | float | Backplate temperature (Celsius) |
-| `battery_level` | float | Battery charge level |
-| `has_fan` | boolean | Fan control available |
-| `has_humidifier` | boolean | Humidifier detected |
-| `has_dehumidifier` | boolean | Dehumidifier detected |
-| `leaf` | boolean | Leaf icon displayed (energy-saving indicator) |
-| `auto_away` | integer | Occupancy sensor state: `0` = home, `1` = away |
-| `time_to_target` | integer | Estimated seconds to reach target temperature |
-| `time_to_target_training` | string | Training status: `ready`, `training`, or `not_ready` |
-| `error_code` | string | Active error code |
-| `serial_number` | string | Device serial number |
-| `software_version` | string | Firmware version |
-| `model_version` | string | Hardware model |
-| `local_ip` | string | Device IP on local network |
-| `mac_address` | string | Wi-Fi MAC address |
-| `is_online` | boolean | Device considers itself connected |
+> **Note**: `current_temperature` and `auto_away` are in the **shared** bucket, not the device bucket. They are listed here for convenience since they are commonly needed read-only values.
+
+| Field | Type | Bucket | Description |
+|-------|------|--------|-------------|
+| `current_temperature` | float | shared | Current measured temperature (Celsius) |
+| `current_humidity` | integer | device | Current relative humidity (percent) |
+| `backplate_temperature` | float | device | Backplate temperature (Celsius) |
+| `battery_level` | float | device | Battery charge level |
+| `has_fan` | boolean | device | Fan control available |
+| `has_humidifier` | boolean | device | Humidifier detected |
+| `has_dehumidifier` | boolean | device | Dehumidifier detected |
+| `leaf` | boolean | device | Leaf icon displayed (energy-saving indicator) |
+| `auto_away` | integer | shared | Occupancy sensor state: `0` = home, `1` = away |
+| `time_to_target` | integer | device | Estimated seconds to reach target temperature |
+| `time_to_target_training` | string | device | Training status |
+| `error_code` | string | device | Active error code |
+| `serial_number` | string | device | Device serial number |
+| `current_version` | string | device | Firmware version |
+| `model_version` | string | device | Hardware model |
+| `local_ip` | string | device | Device IP on local network |
+| `mac_address` | string | device | Wi-Fi MAC address |
 
 #### Cloud-writable fields
 
@@ -1347,7 +1348,7 @@ These fields accept server writes through subscribe responses. Push them inside 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `click_sound` | boolean | Audible click on dial turn |
+| `click_sound` | string | Audible click on dial turn |
 | `farsight_screen` | string | Display content when approaching |
 | `should_wake_on_approach` | boolean | Wake display on approach |
 | `ob_orientation` | string | O/B wire orientation (heat pumps) |
@@ -1356,6 +1357,7 @@ These fields accept server writes through subscribe responses. Push them inside 
 | `sunlight_correction_enabled` | boolean | Compensate for direct sunlight on sensor |
 | `where_id` | string | Room assignment identifier |
 | `pro_id` | string | Nest Pro installer identifier |
+| `logging_priority` | string | Logging verbosity level |
 
 **Filter reminders:**
 
@@ -1373,6 +1375,10 @@ These fields accept server writes through subscribe responses. Push them inside 
 **Setup wizard state** (out-of-box):
 
 `oob_interview_completed`, `oob_temp_completed`, `oob_test_completed`, `oob_startup_completed`, `oob_summary_completed`, `oob_where_completed`, `oob_wifi_completed`, `oob_wires_completed`
+
+**Installation flow** (setup/pairing):
+
+`ifj_assisting_device_id`, `ifj_result`
 
 ### shared bucket
 
@@ -1696,7 +1702,7 @@ The device serializes temperatures with up to 5 decimal places (for example, `21
 
 ### Write protection
 
-The device protects ~113 device-only fields from server writes. If you push a value for one of these fields, the device compares it against its local value. If different, it marks the field dirty and re-sends its own value in the next PUT — actively overwriting your change. Accept these re-PUTs normally.
+The device protects 113 device-only fields from server writes. If you push a value for one of these fields, the device compares it against its local value. If different, it marks the field dirty and re-sends its own value in the next PUT — actively overwriting your change. Accept these re-PUTs normally.
 
 Twelve device-only fields have explicit consistency checking and logging:
 
