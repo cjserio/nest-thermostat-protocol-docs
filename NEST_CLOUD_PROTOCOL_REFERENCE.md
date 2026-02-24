@@ -2218,9 +2218,9 @@ To deactivate eco mode, send `manual_eco_all: false` and `away: false` in the st
 }
 ```
 
-> **Caution**: Always include `away: false` when exiting eco mode. The `manual_eco_all` field is subject to the same 600-second timestamp validation on exit as on entry — if the device's clock has drifted, it silently drops the change and eco mode persists. The `away` field has no timestamp validation, so it always takes effect and serves as a reliable fallback.
+> **Caution**: The `manual_eco_all` field is subject to the same 600-second timestamp validation on exit as on entry — if the device's clock has drifted, it silently drops the change and eco mode persists. Including `away: false` provides an alternative exit path, but this path depends on an internal device subsystem being ready. Under normal operation it works, but it is not guaranteed to take effect immediately.
 >
-> **Caution**: Always include the device bucket `eco.mode: "schedule"` write when exiting eco mode. If your server pushes other device bucket fields in the same subscribe response (which is typical), the device processes the entire merged object. Any stale `eco.mode: "manual-eco"` left over from a previous write will cause the device to re-enter eco mode immediately after the structure bucket exits it. Writing `eco.mode: "schedule"` explicitly overwrites any stale value.
+> **Caution**: Always include the device bucket `eco.mode: "schedule"` write when exiting eco mode. This is the most reliable exit path — the device applies it unconditionally with no timestamp validation and no dependency on internal subsystem state. It also prevents stale `eco.mode: "manual-eco"` values from re-entering eco mode after the structure bucket exits it. Send all three fields (`manual_eco_all`, `away`, and `eco.mode`) together as shown above.
 
 After exiting eco mode, the device performs a fresh schedule lookup. Any previous manual temperature override (from a dial turn or server push) is not restored — the device uses whatever the schedule says at that moment.
 
