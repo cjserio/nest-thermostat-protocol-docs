@@ -1415,7 +1415,7 @@ Controls the active temperature setpoint and HVAC mode. This is the primary buck
 | `target_temperature_low` | float | Read/write | Lower bound in range mode (Celsius) |
 | `target_temperature_type` | string | Read/write | HVAC mode: `heat`, `cool`, `range`, `emergency`, or `off`. See [HVAC modes](#hvac-modes). |
 | `target_change_pending` | boolean | Read/write | Pending temperature change flag. See [Display wake behavior](#display-wake-behavior). |
-| `touched_by` | object | Read | Metadata about the last temperature change source. See [Temperature change source tracking](#temperature-change-source-tracking). |
+| `touched_by` | object | Read/write | Metadata about the last temperature change source. See [Temperature change source tracking](#temperature-change-source-tracking). |
 | `schedule_mode` | string | Read/write | Active schedule mode: `HEAT`, `COOL`, or `RANGE`. See [Temperature schedules](#temperature-schedules). |
 | `can_heat` | boolean | Read | Device supports heating |
 | `can_cool` | boolean | Read | Device supports cooling |
@@ -1519,7 +1519,7 @@ Server                              Device
 
 #### Temperature change source tracking
 
-The device tags every temperature setpoint with metadata describing what caused the change. This is serialized as a `touched_by` object in the shared bucket:
+The shared bucket contains a `touched_by` object that records what caused the last temperature change. Your server is responsible for setting this field — the device does not include `touched_by` in its temperature PUTs. When the device receives `touched_by` from the server, it uses the value for display purposes (for example, showing "Holding until ..." after a dial turn).
 
 ```json
 {
@@ -1532,15 +1532,19 @@ The device tags every temperature setpoint with metadata describing what caused 
 }
 ```
 
-| `touched_by` value | Source |
-|---------------------|--------|
-| `1` | Schedule transition |
-| `2` | Local user interaction (dial turn) |
-| `3` | Remote/cloud push |
+Set `touched_by` whenever you write a temperature change to the shared bucket:
 
-When a user turns the dial, the device creates a "temperature hold" that persists until the next schedule transition. The device displays "Holding until ..." on screen. There is no persistent hold flag — the hold implicitly expires when the schedule timer fires the next different-temperature setpoint.
+| `touched_by` value | When to use |
+|---------------------|-------------|
+| `1` | Your server is applying a schedule transition |
+| `2` | The device PUT a new `target_temperature` (user turned the dial) |
+| `3` | A client app or external API pushed the temperature |
 
-When pushing `target_temperature` from the cloud, set `touched_by.touched_by` to `3` and include a `touched_by.touched_user_id` if your server tracks user identity.
+Set `touched_at` to the current Unix timestamp in seconds and `touched_tzo` to the device's UTC offset in seconds. Include `touched_user_id` if your server tracks user identity; otherwise omit it or send an empty string.
+
+> **Note**: If you don't set `touched_by`, the device defaults to `3` (remote) internally and skips updating its display state. Temperature holds ("Holding until ...") won't display correctly unless you set the value to `2` when the device initiates the change.
+
+When a user turns the dial, the device creates a temperature hold that persists until the next schedule transition. There is no persistent hold flag — the hold implicitly expires when the schedule applies a different setpoint.
 
 ### structure bucket
 
@@ -2847,6 +2851,7 @@ grep "Configuring keep alive" /var/log/messages | tail -1
 
 | Revision | Date | Changes |
 |----------|------|---------|
+| 2.9 | 2026-02-25 | Corrected `touched_by` in shared bucket: changed access from "Read" to "Read/write". The device does not include `touched_by` in temperature PUTs — your server sets this field to indicate the change source, and the device reads it for display state (temperature holds). Rewrote "Temperature change source tracking" section around server responsibility. Fixed eco mode exit caution blocks: `away: false` is not an unconditional fallback (depends on internal device readiness), device bucket `eco.mode: "schedule"` is the most reliable exit path (no timestamp validation, no readiness dependency). |
 | 2.8 | 2026-02-21 | Corrected device identification: on production firmware, the device **always** uses HTTP Basic Authentication (never sends `X-nl-client-id` or `X-nl-device-id` headers). Updated subscribe, PUT, and entry header tables. Rewrote Device Identification section around Basic Auth credential ID parsing. Updated recommended approach to use Basic Auth user ID instead of identity headers. Fixed entry request example to show `Authorization` header. Identity headers documented as non-production fallback. |
 | 2.7 | 2026-02-19 | Rewrote Home/Away and eco mode section. Corrected eco exit guidance: `manual_eco_all: false` can be silently dropped due to 600-second timestamp validation (not "re-entered" as previously stated). Always send `away: false` alongside for reliable exit. Restructured section around developer tasks (enter, exit, read status) instead of internal firmware paths. Added comparison table for `manual_eco_all` vs `away`. Added eco mode status reading section. Removed internal terminology ("manual eco"/"auto eco" as mode names). |
 | 2.6 | 2026-02-12 | Fixed suspend-time-max contradiction: all examples and recommendations now use 300 (was 600 in most places, contradicting the ≤350 constraint from idle connection timeout). Fixed connection errors table: keep-alive timeout causes stale connection (no FIN/RST), not RST packet. Fixed "no server-side mechanism to disable learning" — `learning_mode` is cloud-writable (mode 2). Fixed `current_humidity` type from `float` to `integer`. Fixed `can_heat`/`can_cool` bucket references — fields are shared bucket only (removed incorrect device bucket listing, corrected schedule modes section). |
